@@ -28,18 +28,22 @@ public interface IOutboxEventStore
         CancellationToken cancellationToken);
 
     /// <summary>
-    /// Atomically claims the next publishable row (in creation order) and
-    /// returns it in its claimed state. Publishable means: <c>Pending</c>
-    /// rows whose backoff gate has passed, or <c>Publishing</c> rows whose
-    /// claim lease has expired (a relay that claimed and then crashed). The
-    /// claim is a single find-and-update, so it is race-free even with
-    /// multiple relay instances.
+    /// Atomically claims the next publishable row and returns it in its
+    /// claimed state. Publishable means: a row in <c>Pending</c> or
+    /// <c>Publishing</c> state whose single claim gate
+    /// (<c>claimableAtUtc</c> — backoff time or lease expiry) has passed.
+    /// The claim assigns a fresh claim id (ownership token) and pushes the
+    /// claim gate to the lease expiry, so the row cannot be re-claimed
+    /// until the lease runs out. The claim is a single find-and-update, so
+    /// it is race-free even with multiple relay instances.
     /// </summary>
     /// <param name="now">The current UTC time (injected so tests can drive
-    /// time deterministically).</param>
+    /// time deterministically). The relay passes a fresh value per claim,
+    /// so the lease is always measured against the moment of claiming.</param>
     /// <param name="leaseSeconds">Claim lease length.</param>
     /// <param name="cancellationToken">A cancellation token.</param>
-    /// <returns>The claimed row, or <c>null</c> when nothing is publishable.</returns>
+    /// <returns>The claimed row (with the new claim id), or <c>null</c>
+    /// when nothing is publishable.</returns>
     Task<OutboxEventRecord?> ClaimNextPublishableAsync(
         DateTime now,
         int leaseSeconds,
@@ -47,18 +51,23 @@ public interface IOutboxEventStore
 
     /// <summary>
     /// Marks a claimed row as published (Kafka ack received). The update is
-    /// conditional on the row still being <c>Publishing</c>: if the claim
-    /// lease expired and another instance took over, this is a no-op
-    /// instead of an overwrite.
+    /// conditional on the row still being <c>Publishing</c> <b>and</b>
+    /// still carrying the caller's claim id: if the lease expired and
+    /// another instance took over, this is a no-op instead of an overwrite.
     /// </summary>
     /// <param name="eventId">The event identity.</param>
+    /// <param name="claimId">The claim id this relay received when it
+    /// claimed the row.</param>
     /// <param name="partition">The Kafka partition the record landed in.</param>
     /// <param name="offset">The Kafka offset of the record.</param>
     /// <param name="publishedAtUtc">When the ack arrived (UTC).</param>
     /// <param name="cancellationToken">A cancellation token.</param>
-    /// <returns><c>true</c> when this call recorded the publish.</returns>
+    /// <returns><c>true</c> when this call recorded the publish,
+    /// <c>false</c> when the claim was lost (the row belongs to someone
+    /// else now — or is no longer <c>Publishing</c>).</returns>
     Task<bool> MarkPublishedAsync(
         Guid eventId,
+        Guid claimId,
         int partition,
         long offset,
         DateTime publishedAtUtc,
@@ -66,22 +75,27 @@ public interface IOutboxEventStore
 
     /// <summary>
     /// Records a failed publish attempt on a claimed row. The update is
-    /// conditional on the row still being <c>Publishing</c>. The relay
-    /// decides the outcome: <paramref name="nextRetryAtUtc"/> set → back to
-    /// <c>Pending</c> (retry after backoff); <c>null</c> → <c>Dead</c>
+    /// conditional on the row still being <c>Publishing</c> <b>and</b>
+    /// still carrying the caller's claim id. The relay decides the
+    /// outcome: <paramref name="retryAtUtc"/> set → back to <c>Pending</c>
+    /// (claimable again after the backoff); <c>null</c> → <c>Dead</c>
     /// (retry budget exhausted).
     /// </summary>
     /// <param name="eventId">The event identity.</param>
+    /// <param name="claimId">The claim id this relay received when it
+    /// claimed the row.</param>
     /// <param name="newAttempts">The attempt counter after this failure.</param>
-    /// <param name="nextRetryAtUtc">Backoff gate, or <c>null</c> for
+    /// <param name="retryAtUtc">Backoff gate, or <c>null</c> for
     /// <c>Dead</c>.</param>
     /// <param name="lastError">Failure detail for operators.</param>
     /// <param name="cancellationToken">A cancellation token.</param>
-    /// <returns><c>true</c> when this call recorded the failure.</returns>
+    /// <returns><c>true</c> when this call recorded the failure,
+    /// <c>false</c> when the claim was lost.</returns>
     Task<bool> MarkFailedAsync(
         Guid eventId,
+        Guid claimId,
         int newAttempts,
-        DateTime? nextRetryAtUtc,
+        DateTime? retryAtUtc,
         string? lastError,
         CancellationToken cancellationToken);
 }

@@ -24,6 +24,15 @@ public sealed class OutboxOptions
     public int BatchSize { get; init; } = 50;
 
     /// <summary>
+    /// Maximum number of publishes in flight at once. A claimed batch is
+    /// grouped by resource id and the groups run concurrently up to this
+    /// limit — ordering inside a resource is preserved (its events stay
+    /// sequential), while a slow broker round-trip no longer blocks every
+    /// other resource behind it.
+    /// </summary>
+    public int PublishConcurrency { get; init; } = 8;
+
+    /// <summary>
     /// The maximum number of publish attempts before a row is marked
     /// <see cref="OutboxEventStatus.Dead"/>.
     /// </summary>

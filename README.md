@@ -31,8 +31,10 @@ without being tied to a specific business domain.
 - **Real EF Core migrations** — the SQLite schema is managed by
   `dotnet-ef` migrations applied at startup, not `EnsureCreated`.
 - **Transactional outbox** — domain events are written to the same MongoDB
-  transaction as the aggregate write, then relayed to Kafka (at-least-once;
-  consumers dedupe on the stable `x-event-id` header).
+  transaction as the aggregate write (Mongo storage provider only — the
+  SQLite/EF path dispatches events in-process, without the outbox), then
+  relayed to Kafka (at-least-once; consumers dedupe on the stable
+  `x-event-id` header / `eventId` field).
 - **Docker** — multi-stage `Dockerfile` on .NET 10 images (runs as the
   unprivileged `app` user, `curl`-based healthcheck) + `docker-compose.yml`
   (API + single-node MongoDB replica set + Apache Kafka 4 + a logging
@@ -312,6 +314,7 @@ The persistence backend is selected from the `Storage` configuration section
 | `Kafka:Topic` | `resource-events` | Topic the outbox relay publishes to |
 | `Outbox:PollIntervalMs` | `1000` | Relay poll interval |
 | `Outbox:BatchSize` | `50` | Max events claimed per poll |
+| `Outbox:PublishConcurrency` | `8` | Max in-flight publishes (per-resource ordering preserved) |
 | `Outbox:MaxAttempts` | `5` | Publish attempts before an event is marked `Dead` |
 | `Outbox:LeaseSeconds` | `30` | Claim lease; expired leases are reclaimable (crash recovery) |
 | `Outbox:BaseRetryDelayMs` | `5000` | Base of the exponential retry backoff |
@@ -333,28 +336,31 @@ docker compose up -d --build
 |---------|-------|-----------|
 | `api` | built from `src/DotNetApiPi.Api/Dockerfile` (multi-stage on .NET 10 images: `sdk:10.0` → `aspnet:10.0`, non-root `app` user) | 8090 → 8080 |
 | `consumer` | built from `src/DotNetApiPi.Consumer/Dockerfile` — consumes `resource-events` and logs every message (content + metadata) to Docker logs | — |
-| `mongo` | `mongo:8`, single-node replica set `rs0` (multi-document transactions require a replica set); no auth, loopback-only ports | 27018 → 27017 |
+| `mongo` | `mongo:8`, single-node replica set `rs0` **with authentication** (keyFile + root user from `MONGO_USER`/`MONGO_PASSWORD`, defaults `root`/`devpass123`); loopback-only ports | 27018 → 27017 |
 | `kafka` | `apache/kafka:4.3.1` (KRaft-only, single broker+controller node; topic `resource-events` pre-created by `kafka-init`) | 29092 → 29092 (external listener for host tooling) |
 
-One-shot helpers: `mongo-init` (initiates the replica set, idempotent) and
-`kafka-data-init` (fixes volume ownership before the KRaft bootstrap). All
-services carry healthchecks and ordered `depends_on`, so the stack converges
-without manual steps; `docker compose ps` reports the API *healthy* only once
-startup — including Mongo index creation and the outbox relay startup — has
-completed.
+One-shot helpers: `mongo-keyfile-init` (generates the replica-set keyFile
+once into a named volume — an authenticated replica set requires one),
+`mongo-init` (runs `rs.initiate` as the root user and waits for a writable
+primary; idempotent) and `kafka-data-init` (fixes volume ownership before
+the KRaft bootstrap). All services carry healthchecks and ordered
+`depends_on`, so the stack converges without manual steps; `docker compose
+ps` reports the API *healthy* only once startup — including Mongo index
+creation and the outbox relay startup — has completed.
 
 The API container is configured for the **Mongo** storage provider
 (`Storage__Provider=mongo`, connection string
-`mongodb://mongo:27017/?replicaSet=rs0`) and publishes to Kafka
+`mongodb://root:devpass123@mongo:27017/?replicaSet=rs0&authSource=admin` —
+override with `MONGO_USER`/`MONGO_PASSWORD` in a `.env`, see
+`.env.example`) and publishes to Kafka
 (`Kafka__BootstrapServers=kafka:19092`, topic `resource-events`).
 
-> **Security note:** the dev stack runs MongoDB **without authentication** and
-> Kafka without SASL, and its ports are exposed on the host. This is an
-> intentional local-development scaffold (loopback only) — a single-node
-> replica set with auth needs a keyFile bootstrap that a no-restart compose
-> stack cannot express. For anything beyond localhost, front the services
-> with real auth (MongoDB keyFile replica-set users, Kafka SASL) or run the
-> API against your own broker.
+> **Security note:** the dev stack runs an authenticated single-node MongoDB
+> replica set (keyFile + root user, development credentials by default) and
+> Kafka without SASL, and its ports are exposed on loopback only. This is
+> an intentional local-development scaffold. For anything beyond localhost,
+> use real secrets (never the defaults), a multi-node replica set, and
+> Kafka SASL/SCRAM — or run the API against your own broker.
 
 Event flow: an API write commits the aggregate **and** its domain events to
 the `outbox_events` collection in one MongoDB transaction; the outbox relay
@@ -368,12 +374,41 @@ key, headers (`x-event-id`), timestamp and body — as one JSON line:
 docker compose logs -f consumer
 ```
 
-Swagger (Development only): `http://localhost:8090/swagger`; the Mongo shell:
-`mongosh --port 27018`; Kafka tooling on the host: `kcat -b localhost:29092 -C -t resource-events`.
+Swagger (Development only): `http://localhost:8090/swagger`; the Mongo shell
+(authenticated): `mongosh --port 27018 -u root -p devpass123 --authenticationDatabase admin`;
+Kafka tooling on the host: `kcat -b localhost:29092 -C -t resource-events`.
 Host ports are mapped to 8090/27018/29092 because 8080, 27017 and 9092 are
 commonly taken locally — adjust the `ports:` entries in `docker-compose.yml`
 if needed. Stop with `docker compose down` (add `-v` to also delete the
 Mongo/Kafka data).
+
+### Outbox operations (Mongo provider)
+
+The outbox exists **only** for the Mongo storage provider: the SQLite/EF
+path has no multi-document transactions, so it dispatches domain events
+in-process (log subscriber) and never touches `outbox_events` or Kafka.
+
+- **Published rows age out.** A partial TTL index deletes rows in
+  `Published` status 7 days after `publishedAtUtc` (replay/audit horizon);
+  `Pending`, `Publishing` and `Dead` rows are never touched by TTL.
+- **Dead rows.** After `Outbox:MaxAttempts` failed publishes (default 5,
+  exponential backoff) a row becomes `Dead` (`status: 3`, with `lastError`
+  set). Nothing else will retry it — replay it on purpose, e.g. when the
+  broker is back:
+
+  ```js
+  // in mongosh, as the configured user:
+  db.outbox_events.updateMany(
+    { status: 3 },
+    { $set: { status: 0, attempts: 0, claimableAtUtc: new Date() }, $unset: { lastError: "", leaseUntilUtc: "" } })
+  // the relay picks the rows up within one poll interval.
+  ```
+
+  Replayed events are re-delivered to Kafka; consumers must tolerate this
+  (dedupe on `x-event-id` / `eventId` — delivery is at-least-once by design).
+- **Indexes** (created by the initializer): `status_claimableAtUtc`
+  (serves the relay's claim query, filter + sort, index-only) and
+  `resourceId` (per-resource lookups).
 
 ## Versioning & CI
 

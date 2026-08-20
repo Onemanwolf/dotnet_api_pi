@@ -7,6 +7,20 @@ every message's content and metadata to `docker logs`.
 
 Status: research complete — findings below are from primary sources (fetched 2026-08-20).
 
+> **Revision 2 (2026-08-20, review round):** the implemented design evolved
+> beyond v1 of this plan — see `PROGRESS.md`, "Outbox review round 2":
+> MongoDB switched to an **authenticated keyFile replica set** (compose
+> `mongo-keyfile-init` + authenticated `rs.initiate`); the claim gate
+> collapsed to a single `claimableAtUtc` field served by the
+> `status_claimableAtUtc` index (O-04/O-09); claims carry a `claimId`
+> owner token so lost claims are detectable (O-05); the relay reads the
+> clock per claim/mark (O-06) and publishes with bounded concurrency
+> `Outbox:PublishConcurrency` (O-07); `eventType` is a stable wire name
+> from `DomainEventWireTypes` and the envelope carries `schemaVersion`
+> (O-08); Published rows age out via a 7-day partial TTL index (O-03); the
+> README documents the dead-letter replay runbook (O-10) and that the
+> outbox is Mongo-provider-only (O-11).
+
 ---
 
 ## 1. Research findings (deep research, 2026-08-20)

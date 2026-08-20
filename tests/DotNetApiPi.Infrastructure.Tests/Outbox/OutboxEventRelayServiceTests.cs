@@ -8,8 +8,11 @@ namespace DotNetApiPi.Infrastructure.Tests.Outbox;
 /// <summary>
 /// Tests for the <see cref="OutboxEventRelayService"/> loop against an
 /// in-memory outbox store and a fake Kafka publisher: happy-path publish
-/// (Published + partition/offset), failure retry with backoff until the row
-/// goes Dead, and lease-expiry re-claim of a crashed claim.
+/// (Published + partition/offset + envelope schema), failure retry with
+/// backoff until the row goes Dead, lease-expiry re-claim of a crashed
+/// claim, and graceful handling of a lost claim (lease expired, another
+/// relay owns the row — the mark is a no-op and the event is re-delivered
+/// under the new claim).
 /// </summary>
 public sealed class OutboxEventRelayServiceTests : IDisposable
 {
@@ -38,7 +41,7 @@ public sealed class OutboxEventRelayServiceTests : IDisposable
 
         var resourceId = Guid.NewGuid();
         var eventId = Guid.NewGuid();
-        store.Add(PendingEvent(eventId, "ResourceCreated", resourceId));
+        store.Add(PendingEvent(eventId, "resource.created.v1", resourceId));
 
         await UntilAsync(
             async () =>
@@ -58,10 +61,12 @@ public sealed class OutboxEventRelayServiceTests : IDisposable
         Assert.Equal(resourceId.ToString("D"), publisher.LastKey);
         Assert.Equal(eventId.ToString("D"), publisher.LastHeaders?["x-event-id"]);
 
-        // The wire payload is the camelCase envelope.
+        // The wire payload is the camelCase envelope with its schema
+        // version and stable event-type name.
         using var envelope = System.Text.Json.JsonDocument.Parse(publisher.LastValue!);
+        Assert.Equal(1, envelope.RootElement.GetProperty("schemaVersion").GetInt32());
         Assert.Equal(eventId.ToString("D"), envelope.RootElement.GetProperty("eventId").GetString());
-        Assert.Equal("ResourceCreated", envelope.RootElement.GetProperty("eventType").GetString());
+        Assert.Equal("resource.created.v1", envelope.RootElement.GetProperty("eventType").GetString());
     }
 
     [Fact(Timeout = 20_000)]
@@ -79,7 +84,7 @@ public sealed class OutboxEventRelayServiceTests : IDisposable
         });
 
         var eventId = Guid.NewGuid();
-        store.Add(PendingEvent(eventId, "ResourceActivated", Guid.NewGuid()));
+        store.Add(PendingEvent(eventId, "resource.activated.v1", Guid.NewGuid()));
 
         await UntilAsync(
             async () =>
@@ -110,12 +115,14 @@ public sealed class OutboxEventRelayServiceTests : IDisposable
         });
 
         // A claim left behind by a crashed relay instance: Publishing with
-        // an expired lease.
+        // an expired lease (the claim gate has passed, so the row is
+        // publishable again).
         var eventId = Guid.NewGuid();
-        var stuck = PendingEvent(eventId, "ResourceArchived", Guid.NewGuid());
+        var stuck = PendingEvent(eventId, "resource.archived.v1", Guid.NewGuid());
         store.Add(stuck with
         {
             Status = OutboxEventStatus.Publishing,
+            ClaimableAtUtc = _time.GetUtcNow().UtcDateTime - TimeSpan.FromSeconds(60),
             LeaseUntilUtc = _time.GetUtcNow().UtcDateTime - TimeSpan.FromSeconds(60)
         });
 
@@ -128,6 +135,52 @@ public sealed class OutboxEventRelayServiceTests : IDisposable
             "row to be re-claimed and Published");
 
         Assert.Equal(0, store.Find(eventId)!.TopicPartition);
+    }
+
+    [Fact(Timeout = 20_000)]
+    public async Task Relay_SurvivesLostClaim_AndRedeliversUnderNewClaim()
+    {
+        // O-05: the lease must be a real ownership guarantee. If the row is
+        // taken over while this relay is mid-publish (the mark finds the row
+        // no longer owned by its claim id), the relay must NOT treat the
+        // failure as fatal and NOT corrupt the row — and the event must
+        // still be delivered, under the new claim.
+        var store = new InMemoryOutboxStore
+        {
+            TakeOverBeforeFirstMark = true
+        };
+        var publisher = new FakePublisher(
+            static (_, _, _, _) => new KafkaPublishResult("resource-events", 1, 3));
+        var relay = StartRelay(store, publisher, new OutboxOptions
+        {
+            PollIntervalMs = 10,
+            BatchSize = 1,
+            LeaseSeconds = 30
+        });
+
+        var eventId = Guid.NewGuid();
+        store.Add(PendingEvent(eventId, "resource.deleted.v1", Guid.NewGuid()));
+
+        await UntilAsync(
+            async () =>
+            {
+                var row = store.Find(eventId);
+                return row is not null && row.Status == OutboxEventStatus.Published;
+            },
+            "row to be Published after the lost claim",
+            advanceClock: true);
+
+        // Delivered twice (the publish before the takeover, plus the
+        // re-delivery under the new claim): at-least-once, de-duplicated by
+        // consumers on x-event-id.
+        Assert.Equal(2, publisher.CallCount);
+
+        // The row was not corrupted by the failed mark: it carries the new
+        // claim's outcome.
+        var row = store.Find(eventId)!;
+        Assert.NotEqual(Guid.Empty, row.ClaimId);
+        Assert.Equal(1, row.TopicPartition);
+        Assert.Equal(3L, row.Offset);
     }
 
     private OutboxEventRelayService StartRelay(
@@ -149,12 +202,14 @@ public sealed class OutboxEventRelayServiceTests : IDisposable
         return relay;
     }
 
-    private static OutboxEventRecord PendingEvent(
+    private OutboxEventRecord PendingEvent(
         Guid eventId,
         string eventType,
         Guid resourceId)
     {
-        var now = DateTime.UtcNow;
+        // Use the test clock (not the wall clock): the relay and the store
+        // both evaluate claim gates against _time.
+        var now = _time.GetUtcNow().UtcDateTime;
 
         return new OutboxEventRecord(
             eventId,
@@ -165,7 +220,8 @@ public sealed class OutboxEventRelayServiceTests : IDisposable
             OutboxEventStatus.Pending,
             0,
             now,
-            null,
+            now, // claimable immediately
+            Guid.Empty, // assigned on first claim
             null,
             null,
             null,
@@ -193,8 +249,9 @@ public sealed class OutboxEventRelayServiceTests : IDisposable
                 throw new TimeoutException($"Timed out waiting for {description}.");
             }
 
-            // With a fixed clock, backoff-gated rows are never publishable
-            // again unless the clock moves past their nextRetryAt.
+            // With a fixed clock, backoff-gated rows (and expired leases)
+            // are never publishable again unless the clock moves past their
+            // claimableAtUtc.
             if (advanceClock)
             {
                 _time.UtcNow = _time.UtcNow.AddSeconds(30);
@@ -206,13 +263,23 @@ public sealed class OutboxEventRelayServiceTests : IDisposable
 
     /// <summary>
     /// Thread-safe in-memory outbox store honoring the store contract:
-    /// publishable = Pending (backoff gate passed or absent) or Publishing
-    /// (lease expired); claims are oldest-first by creation time.
+    /// publishable = Pending or Publishing with the claim gate
+    /// (<c>claimableAtUtc</c>) passed; claims are oldest-first by claim
+    /// gate; marks apply only while the caller's claim id still matches
+    /// (a lost claim is a no-op that returns <c>false</c>).
     /// </summary>
     private sealed class InMemoryOutboxStore : IOutboxEventStore
     {
         private readonly object _gate = new();
         private readonly Dictionary<Guid, OutboxEventRecord> _rows = new();
+
+        /// <summary>
+        /// When set, the next <see cref="MarkPublishedAsync"/> simulates a
+        /// takeover by a new claimant first (the mark then finds the row no
+        /// longer owned by the caller's claim id and fails), clearing the
+        /// flag after use.
+        /// </summary>
+        public bool TakeOverBeforeFirstMark { get; set; }
 
         public void Add(OutboxEventRecord record)
         {
@@ -260,22 +327,21 @@ public sealed class OutboxEventRelayServiceTests : IDisposable
             lock (_gate)
             {
                 claimed = _rows.Values
-                    .Where(r =>
-                        (r.Status == OutboxEventStatus.Pending
-                            && (r.NextRetryAtUtc is null || r.NextRetryAtUtc <= now))
-                        || (r.Status == OutboxEventStatus.Publishing
-                            && r.LeaseUntilUtc is not null
-                            && r.LeaseUntilUtc <= now))
-                    .OrderBy(static r => r.CreatedAtUtc)
+                    .Where(static r => r.Status is OutboxEventStatus.Pending or OutboxEventStatus.Publishing)
+                    .Where(r => r.ClaimableAtUtc <= now)
+                    .OrderBy(static r => r.ClaimableAtUtc)
                     .ThenBy(static r => r.EventId)
                     .FirstOrDefault();
 
                 if (claimed is not null)
                 {
+                    var leaseUntil = now.AddSeconds(leaseSeconds);
                     var updated = claimed with
                     {
                         Status = OutboxEventStatus.Publishing,
-                        LeaseUntilUtc = now.AddSeconds(leaseSeconds),
+                        ClaimId = Guid.NewGuid(),
+                        ClaimableAtUtc = leaseUntil,
+                        LeaseUntilUtc = leaseUntil,
                         LastError = null
                     };
                     _rows[claimed.EventId] = updated;
@@ -288,6 +354,7 @@ public sealed class OutboxEventRelayServiceTests : IDisposable
 
         public Task<bool> MarkPublishedAsync(
             Guid eventId,
+            Guid claimId,
             int partition,
             long offset,
             DateTime publishedAtUtc,
@@ -298,7 +365,25 @@ public sealed class OutboxEventRelayServiceTests : IDisposable
             lock (_gate)
             {
                 var row = _rows.GetValueOrDefault(eventId);
-                applied = row is not null && row.Status == OutboxEventStatus.Publishing;
+
+                // Simulated takeover: the row is no longer owned by the
+                // caller's claim id when the mark arrives.
+                if (row is not null && TakeOverBeforeFirstMark)
+                {
+                    TakeOverBeforeFirstMark = false;
+                    var takenOver = row with
+                    {
+                        ClaimId = Guid.NewGuid(),
+                        ClaimableAtUtc = row.ClaimableAtUtc,
+                        LeaseUntilUtc = row.LeaseUntilUtc
+                    };
+                    _rows[eventId] = takenOver;
+                    row = takenOver;
+                }
+
+                applied = row is not null
+                    && row.Status == OutboxEventStatus.Publishing
+                    && row.ClaimId == claimId;
 
                 if (applied)
                 {
@@ -319,8 +404,9 @@ public sealed class OutboxEventRelayServiceTests : IDisposable
 
         public Task<bool> MarkFailedAsync(
             Guid eventId,
+            Guid claimId,
             int attempts,
-            DateTime? nextRetryAtUtc,
+            DateTime? retryAtUtc,
             string? error,
             CancellationToken cancellationToken)
         {
@@ -329,21 +415,32 @@ public sealed class OutboxEventRelayServiceTests : IDisposable
             lock (_gate)
             {
                 var row = _rows.GetValueOrDefault(eventId);
-                applied = row is not null && row.Status == OutboxEventStatus.Publishing;
+
+                applied = row is not null
+                    && row.Status == OutboxEventStatus.Publishing
+                    && row.ClaimId == claimId;
 
                 if (applied)
                 {
-                    // A null nextRetryAtUtc signals the relay's terminal
-                    // branch: the row is Dead.
-                    _rows[eventId] = row! with
+                    // A null retryAtUtc signals the relay's terminal branch:
+                    // the row is Dead. Otherwise it goes back to Pending,
+                    // claimable again after the backoff.
+                    var updated = row! with
                     {
-                        Status = nextRetryAtUtc is null
+                        Status = retryAtUtc is null
                             ? OutboxEventStatus.Dead
                             : OutboxEventStatus.Pending,
                         Attempts = attempts,
-                        NextRetryAtUtc = nextRetryAtUtc,
+                        LeaseUntilUtc = null,
                         LastError = error
                     };
+
+                    if (retryAtUtc is not null)
+                    {
+                        updated = updated with { ClaimableAtUtc = retryAtUtc.Value };
+                    }
+
+                    _rows[eventId] = updated;
                 }
             }
 

@@ -6,17 +6,24 @@
 # separate consumer container (src/DotNetApiPi.Consumer/Dockerfile) reads the
 # topic and logs every message's content and metadata to docker logs.
 #
-# CREDENTIALS: this scaffold runs MongoDB WITHOUT authentication (see the
-# SECURITY NOTE below): an authenticated replica set requires a shared
-# security.keyFile on every member, which a no-restart single-node local
-# dev stack cannot bootstrap. Kafka runs PLAINTEXT (no SASL). The ports are
-# exposed on loopback only.
+# CREDENTIALS: this scaffold runs a SINGLE-NODE AUTHENTICATED MongoDB
+# replica set. The keyFile (required for any authenticated replica set)
+# is generated once into the mongo-keyfile volume by the one-shot
+# mongo-keyfile-init service. The root user is created by the official
+# image entrypoint from MONGO_USER / MONGO_PASSWORD (defaults below;
+# override via .env — see .env.example). Kafka runs PLAINTEXT (no SASL).
+# All exposed ports are loopback-only.
 #
-# SECURITY NOTE: this is a local development scaffold — MongoDB and Kafka
-# are unauthenticated and reachable on localhost ports 27018/29092. Never
-# run this configuration on a network other than loopback/localhost.
-# Production deployments must add auth: for MongoDB a replica set with a
-# keyFile + created users, for Kafka SASL/SCRAM (+ mTLS at the edges).
+# SECURITY NOTE: this is a local development scaffold — the MongoDB and
+# Kafka credentials here are development defaults and the ports are
+# reachable on localhost only (27018/29092). Never run this configuration
+# on a network other than loopback/localhost. Production deployments must
+# use real secrets, a multi-node replica set, and Kafka SASL/SCRAM
+# (+ mTLS at the edges).
+#
+# NOTE: if you previously ran the unauthenticated variant of this stack,
+# its mongo volume has no users — run `docker compose down --volumes`
+# first, otherwise the API will be rejected with an authentication error.
 services:
   api:
     build:
@@ -33,12 +40,12 @@ services:
       # (see src/DotNetApiPi.Api/Dockerfile).
       ASPNETCORE_ENVIRONMENT: Development
       Storage__Provider: mongo
-      # The root user is created in the admin database by
-      # MONGO_INITDB_ROOT_*, hence authSource=admin. The replicaSet parameter
-      # tells the driver to treat the server as a replica set (multi-document
-      # transactions — required by the outbox write path — only work on a
-      # replica set).
-      Storage__MongoConnectionString: "mongodb://mongo:27017/?replicaSet=rs0"
+      # Authenticated connection: the root user (admin database) is created
+      # by the image entrypoint from MONGO_USER/MONGO_PASSWORD on first init,
+      # hence authSource=admin. The replicaSet parameter tells the driver to
+      # treat the server as a replica set (multi-document transactions —
+      # required by the outbox write path — only work on a replica set).
+      Storage__MongoConnectionString: "mongodb://${MONGO_USER:-root}:${MONGO_PASSWORD:-devpass123}@mongo:27017/?replicaSet=rs0&authSource=admin"
       Storage__MongoDatabaseName: dotnet_api_pi
       # Outbox relay: publish committed outbox rows to the topic. From inside
       # the compose network the broker is reached via its internal listener.
@@ -67,13 +74,42 @@ services:
       start_period: 15s
     restart: unless-stopped
 
+  # One-shot: generate the replica-set keyFile exactly once (into the
+  # mongo-keyfile volume). An authenticated replica set unconditionally
+  # requires a shared keyFile on every member (the localhost exception is
+  # disabled for RS members). The file is chowned to the mongodb image user
+  # (999) and locked to mode 400 before mongod starts. Re-runs are no-ops
+  # (the file persists in the named volume, so the RS identity is stable
+  # across restarts).
+  mongo-keyfile-init:
+    image: mongo:8
+    container_name: dotnet-api-pi-mongo-keyfile-init
+    command:
+      - "/bin/sh"
+      - "-c"
+      - "[ -f /keyfile/keyfile ] || { openssl rand -base64 756 > /keyfile/keyfile && chown 999:999 /keyfile/keyfile && chmod 400 /keyfile/keyfile; }; echo 'mongo keyfile is ready'"
+    volumes:
+      - mongo-keyfile:/keyfile
+
   mongo:
     image: mongo:8
     container_name: dotnet-api-pi-mongo
-    # Single-node replica set: multi-document transactions (the outbox write
-    # path) and change streams are only available on a replica set, not on a
-    # standalone mongod. mongo-init performs the one-time rs.initiate.
-    command: ["--replSet", "rs0", "--bind_ip_all"]
+    # Single-node replica set WITH authentication: multi-document
+    # transactions (the outbox write path) only work on a replica set, and
+    # any authenticated replica set requires a keyFile. The entrypoint
+    # creates the root user from MONGO_USER/MONGO_PASSWORD on first init
+    # (empty data volume only); mongo-init performs the one-time
+    # rs.initiate against that authenticated root user.
+    command: ["--replSet", "rs0", "--bind_ip_all", "--keyFile", "/keyfile/keyfile"]
+    depends_on:
+      # The keyfile must exist (and be owned 999:999, mode 400) before
+      # mongod starts: with --keyFile, mongod refuses to start when the
+      # file is missing or unwritable-by-root-owned.
+      mongo-keyfile-init:
+        condition: service_completed_successfully
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:-root}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-devpass123}
     # The host port is mapped to 27018 so the scaffold keeps working even
     # when a local MongoDB already occupies 27017. Inside the compose
     # network the API always reaches Mongo at mongo:27017.
@@ -81,40 +117,43 @@ services:
       - "27018:27017"
     volumes:
       - mongo-data:/data/db
-    # ping succeeds before the replica set is initiated, so the API
-    # additionally waits on mongo-init (which waits for a writable primary).
+      # The keyfile is pre-generated (owned 999:999, mode 400) by
+      # mongo-keyfile-init; read-only here so mongod cannot tamper with it.
+      - mongo-keyfile:/keyfile:ro
+    # hello does not require authentication, so this probe works before the
+    # user creation / rs.initiate completes; the API additionally waits on
+    # mongo-init (which authenticates as root and waits for a writable
+    # primary).
     healthcheck:
-      test: ["CMD-SHELL", "mongosh --quiet --eval \"db.adminCommand('ping')\" >/dev/null"]
+      test: ["CMD-SHELL", "mongosh --quiet --eval \"db.hello()\" >/dev/null"]
       interval: 5s
       timeout: 5s
       retries: 20
       start_period: 10s
     restart: unless-stopped
 
-  # One-shot: idempotently initiate the single-node replica set (rs0) and
-  # wait until the node is a writable primary, then exit 0. Re-runs are no-ops
-  # (rs.initiate is only executed when no replica set config exists yet).
+  # One-shot: idempotently initiate the single-node replica set (rs0) as the
+  # authenticated root user and wait until the node is a writable primary,
+  # then exit 0. Re-runs are no-ops (rs.initiate is only executed when no
+  # replica set config exists yet).
   mongo-init:
     image: mongo:8
     container_name: dotnet-api-pi-mongo-init
+    environment:
+      MONGO_USER: ${MONGO_USER:-root}
+      MONGO_PASSWORD: ${MONGO_PASSWORD:-devpass123}
     depends_on:
       mongo:
         condition: service_healthy
     # The script travels as a list element after "/bin/sh" "-c": this
     # compose version mangles a plain scalar command (it shell-form-splits
-    # it, so only the first token reaches the container).
-    # The script is a single-line, single-quoted-safe list element after
-    # "/bin/sh" "-c": this compose version mangles a plain scalar
-    # command (it shell-form-splits it, so only the first token would
-    # reach the container).
-    # The script is a single-line list element after "/bin/sh" "-c":
-    # this compose version mangles a plain scalar command (it
-    # shell-form-splits it, so only the first token would reach the
-    # container).
+    # it, so only the first token would reach the container). The
+    # connection string is assembled from $MONGO_USER/$MONGO_PASSWORD at run
+    # time ($$ escapes compose interpolation).
     command:
       - "/bin/sh"
       - "-c"
-      - 'ok=0; for i in $$(seq 1 60); do if mongosh --host mongo:27017 --quiet --eval ''try { rs.status().ok; } catch (e) { rs.initiate({ _id: "rs0", members: [{ _id: 0, host: "mongo:27017" }] }); }'' >/dev/null 2>&1; then ok=1; break; fi; sleep 2; done; if [ "$$ok" != "1" ]; then echo "ERROR: could not initiate replica set rs0 on mongo:27017" >&2; exit 1; fi; primary=0; for i in $$(seq 1 60); do if mongosh --host mongo:27017 --quiet --eval ''db.hello().isWritablePrimary'' | grep -q true; then primary=1; break; fi; sleep 2; done; if [ "$$primary" != "1" ]; then echo "ERROR: replica set rs0 has no writable primary yet" >&2; exit 1; fi; echo ''single-node replica set rs0 has a writable primary'''
+      - 'conn="mongodb://$$MONGO_USER:$$MONGO_PASSWORD@mongo:27017/admin?authSource=admin"; ok=0; for i in $$(seq 1 60); do if mongosh "$$conn" --quiet --eval ''try { rs.status().ok; } catch (e) { rs.initiate({ _id: "rs0", members: [{ _id: 0, host: "mongo:27017" }] }); }'' >/dev/null 2>&1; then ok=1; break; fi; sleep 2; done; if [ "$$ok" != "1" ]; then echo "ERROR: could not initiate replica set rs0 on mongo:27017 (auth as root)" >&2; exit 1; fi; primary=0; for i in $$(seq 1 60); do if mongosh "$$conn" --quiet --eval ''db.hello().isWritablePrimary'' | grep -q true; then primary=1; break; fi; sleep 2; done; if [ "$$primary" != "1" ]; then echo "ERROR: replica set rs0 has no writable primary yet" >&2; exit 1; fi; echo ''single-node authenticated replica set rs0 has a writable primary'''
   # One-shot: fix ownership of the Kafka data volume. The image runs as
   # appuser (uid 1000), but a freshly seeded named volume is root-owned,
   # which makes the KRaft bootstrap formatting fail with AccessDenied.
@@ -220,4 +259,5 @@ services:
 
 volumes:
   mongo-data:
+  mongo-keyfile:
   kafka-data:

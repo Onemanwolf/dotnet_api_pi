@@ -8,14 +8,18 @@ namespace DotNetApiPi.Infrastructure.Outbox;
 /// bookkeeping (status, attempts, lease, last error) never leaves the
 /// database; only the event itself and its stable identities cross the wire.
 /// </summary>
+/// <param name="SchemaVersion">Envelope schema version, so consumers can
+/// evolve with the contract instead of guessing.</param>
 /// <param name="EventId">Stable event identity (= outbox row id, = the
 /// <c>x-event-id</c> header). Consumers use it for idempotency.</param>
-/// <param name="EventType">Stable discriminator for the payload.</param>
+/// <param name="EventType">Stable discriminator for the payload (the wire
+/// name, e.g. <c>resource.created.v1</c> — never a CLR type name).</param>
 /// <param name="ResourceId">The aggregate identity (also the message key).</param>
 /// <param name="OccurredOnUtc">When the domain event occurred.</param>
 /// <param name="Payload">The domain event's payload, preserved verbatim from
 /// the stored row (camelCase JSON of the domain event).</param>
 public sealed record OutboxEventEnvelope(
+    int SchemaVersion,
     Guid EventId,
     string EventType,
     Guid ResourceId,
@@ -64,6 +68,7 @@ public sealed record OutboxEventEnvelope(
         }
 
         return new OutboxEventEnvelope(
+            DomainEventWireTypes.EnvelopeSchemaVersion,
             record.EventId,
             record.EventType,
             record.ResourceId,

@@ -9,8 +9,9 @@ namespace DotNetApiPi.Infrastructure.Outbox;
 /// <param name="EventId">Stable, unique identity of the event (= the outbox
 /// row id and the <c>x-event-id</c> Kafka header). Consumers can use it for
 /// idempotency.</param>
-/// <param name="EventType">Stable discriminator for the payload (the domain
-/// event's CLR type name, e.g. <c>ResourceCreated</c>).</param>
+/// <param name="EventType">Stable discriminator for the payload (the wire
+/// name, e.g. <c>resource.created.v1</c> — see
+/// <see cref="DomainEventWireTypes"/>; never a CLR type name).</param>
 /// <param name="ResourceId">The identity of the aggregate the event belongs
 /// to; also the Kafka message key (per-resource ordering).</param>
 /// <param name="OccurredOnUtc">When the domain event occurred (stamped by
@@ -20,8 +21,16 @@ namespace DotNetApiPi.Infrastructure.Outbox;
 /// <param name="Attempts">Number of publish attempts made so far.</param>
 /// <param name="CreatedAtUtc">When the row was written (inside the
 /// aggregate's transaction).</param>
-/// <param name="NextRetryAtUtc">Backoff gate: the row is only claimable
-/// again on/after this time (<c>null</c> = immediately claimable).</param>
+/// <param name="ClaimableAtUtc">The single claim gate: a row is claimable
+/// on/after this instant. Set to the creation time on insert, to the lease
+/// expiry while <c>Publishing</c>, and to the backoff time when a failed
+/// attempt sends the row back to <c>Pending</c>. Collapsing backoff gate and
+/// lease into one field lets the claim query be a single index range
+/// (no <c>$or</c>, no in-memory sort).</param>
+/// <param name="ClaimId">Identity of the current claim: a fresh GUID set by
+/// the claiming relay. The publish/failure updates only apply while this
+/// value still matches, so a late writer whose lease expired can never
+/// overwrite the row a newer claimant owns.</param>
 /// <param name="LeaseUntilUtc">Claim lease: a <c>Publishing</c> row whose
 /// lease has expired is treated as a crash leftover and re-claimable
 /// (<c>null</c> when not claimed).</param>
@@ -41,7 +50,8 @@ public sealed record OutboxEventRecord(
     OutboxEventStatus Status,
     int Attempts,
     DateTime CreatedAtUtc,
-    DateTime? NextRetryAtUtc,
+    DateTime ClaimableAtUtc,
+    Guid ClaimId,
     DateTime? LeaseUntilUtc,
     DateTime? PublishedAtUtc,
     int? TopicPartition,

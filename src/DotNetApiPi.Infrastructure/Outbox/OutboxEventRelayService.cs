@@ -9,11 +9,15 @@ namespace DotNetApiPi.Infrastructure.Outbox;
 /// Background service that moves committed outbox rows to Kafka (the
 /// "message relay" of the transactional-outbox pattern).
 /// <para>
-/// Loop: poll the outbox for publishable rows (in creation order), claim
-/// each one atomically, publish to Kafka (awaiting the broker
-/// acknowledgement), then mark the row <c>Published</c> with the partition
-/// and offset — or record a failed attempt (backoff retry, or
-/// <c>Dead</c> once the attempt budget is exhausted).
+/// Loop: claim up to <c>BatchSize</c> publishable rows (each claim uses a
+/// fresh clock reading, so leases are measured from the moment of
+/// claiming), then publish the batch with bounded concurrency — grouped by
+/// resource id so a resource's events stay sequential while other
+/// resources drain in parallel. Each publish marks its row
+/// <c>Published</c> with the partition and offset (or records a failed
+/// attempt: backoff retry, or <c>Dead</c> once the attempt budget is
+/// exhausted). Mark operations carry the row's claim id, so a claim lost to
+/// a lease-expired takeover is a detectable no-op, never an overwrite.
 /// </para>
 /// <para>
 /// Delivery is at-least-once by design: a crash between the broker ack and
@@ -119,10 +123,11 @@ public sealed class OutboxEventRelayService : IHostedService
     private async Task RunAsync(CancellationToken cancellationToken)
     {
         _logger.LogInformation(
-            "Outbox relay started (topic '{Topic}', poll {PollMs} ms, batch {BatchSize}, max attempts {MaxAttempts}, lease {LeaseSeconds} s).",
+            "Outbox relay started (topic '{Topic}', poll {PollMs} ms, batch {BatchSize}, concurrency {Concurrency}, max attempts {MaxAttempts}, lease {LeaseSeconds} s).",
             _topic,
             _outboxOptions.PollIntervalMs,
             _outboxOptions.BatchSize,
+            _outboxOptions.PublishConcurrency,
             _outboxOptions.MaxAttempts,
             _outboxOptions.LeaseSeconds);
 
@@ -130,37 +135,32 @@ public sealed class OutboxEventRelayService : IHostedService
         {
             while (!cancellationToken.IsCancellationRequested)
             {
-                var now = _time.GetUtcNow().UtcDateTime;
-                var processed = 0;
+                var batch = await ClaimBatchAsync(cancellationToken).ConfigureAwait(false);
 
-                for (var i = 0; i < _outboxOptions.BatchSize; i++)
+                if (batch.Count == 0)
                 {
-                    var record = await _store
-                        .ClaimNextPublishableAsync(
-                            now,
-                            _outboxOptions.LeaseSeconds,
-                            cancellationToken)
-                        .ConfigureAwait(false);
-
-                    if (record is null)
-                    {
-                        break;
-                    }
-
-                    processed++;
-
-                    // Never let a single row's failure break the loop.
-                    await ProcessClaimedAsync(record, cancellationToken).ConfigureAwait(false);
-                }
-
-                // Work found: go straight to the next batch. Idle: back off
-                // for one poll interval.
-                if (processed == 0)
-                {
+                    // Idle: back off for one poll interval.
                     await Task
                         .Delay(TimeSpan.FromMilliseconds(_outboxOptions.PollIntervalMs), cancellationToken)
                         .ConfigureAwait(false);
+                    continue;
                 }
+
+                // Publish the batch with bounded concurrency, grouped by
+                // resource: one resource's events stay sequential (same
+                // Kafka key => same partition), while a slow round-trip on
+                // one resource no longer blocks every other resource.
+                var groups = batch.GroupBy(static record => record.ResourceId).ToList();
+
+                using var throttle = new SemaphoreSlim(
+                    _outboxOptions.PublishConcurrency,
+                    _outboxOptions.PublishConcurrency);
+
+                var groupTasks = groups
+                    .Select(group => RunResourceGroupAsync(group, throttle, cancellationToken))
+                    .ToArray();
+
+                await Task.WhenAll(groupTasks).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException)
@@ -169,6 +169,62 @@ public sealed class OutboxEventRelayService : IHostedService
         }
 
         _logger.LogInformation("Outbox relay stopped.");
+    }
+
+    /// <summary>
+    /// Claims up to <c>BatchSize</c> publishable rows, reading the clock
+    /// fresh for every claim so each lease is measured from its own claim
+    /// instant (a stale cycle-wide timestamp would make later rows' leases
+    /// already expired by the time the broker is degraded).
+    /// </summary>
+    private async Task<List<OutboxEventRecord>> ClaimBatchAsync(CancellationToken cancellationToken)
+    {
+        var batch = new List<OutboxEventRecord>();
+
+        for (var i = 0; i < _outboxOptions.BatchSize; i++)
+        {
+            var record = await _store
+                .ClaimNextPublishableAsync(
+                    _time.GetUtcNow().UtcDateTime,
+                    _outboxOptions.LeaseSeconds,
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            if (record is null)
+            {
+                break;
+            }
+
+            batch.Add(record);
+        }
+
+        return batch;
+    }
+
+    /// <summary>
+    /// Runs one resource's claimed rows (in claim order) under the
+    /// concurrency throttle.
+    /// </summary>
+    private async Task RunResourceGroupAsync(
+        IEnumerable<OutboxEventRecord> group,
+        SemaphoreSlim throttle,
+        CancellationToken cancellationToken)
+    {
+        await throttle.WaitAsync(cancellationToken).ConfigureAwait(false);
+
+        try
+        {
+            foreach (var record in group)
+            {
+                // Never let a single row's failure break the group (or the
+                // loop): failures are recorded on the row instead.
+                await ProcessClaimedAsync(record, cancellationToken).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            throttle.Release();
+        }
     }
 
     /// <summary>
@@ -196,12 +252,13 @@ public sealed class OutboxEventRelayService : IHostedService
                     cancellationToken)
                 .ConfigureAwait(false);
 
-            // Conditional on the row still being Publishing: if the lease
-            // expired mid-publish and a new claimant took over, do not
-            // overwrite their state.
+            // Conditional on the row still being Publishing AND still
+            // carrying this claim's id: if the lease expired mid-publish
+            // and a new claimant took over, do not overwrite their state.
             var recorded = await _store
                 .MarkPublishedAsync(
                     record.EventId,
+                    record.ClaimId,
                     result.Partition,
                     result.Offset,
                     _time.GetUtcNow().UtcDateTime,
@@ -220,8 +277,12 @@ public sealed class OutboxEventRelayService : IHostedService
             }
             else
             {
+                // Lost the claim (lease expired, another relay owns the row
+                // now). The other claimant will publish the event; at-least-
+                // once delivery plus x-event-id de-duplication absorbs the
+                // possible duplicate.
                 _logger.LogWarning(
-                    "Publish record for outbox event {EventId} not applied (claim lost in the meantime).",
+                    "Publish record for outbox event {EventId} not applied — claim lost to another relay; the event will be (re-)delivered by the new claimant.",
                     record.EventId);
             }
         }
@@ -241,77 +302,60 @@ public sealed class OutboxEventRelayService : IHostedService
     }
 
     /// <summary>
-    /// Records a failed publish attempt: backoff retry, or Dead once the
-    /// attempt budget is exhausted.
+    /// Records a failed publish attempt with exponential backoff; sends the
+    /// row to <c>Dead</c> once the attempt budget is exhausted.
     /// </summary>
     private async Task RecordFailureAsync(
         OutboxEventRecord record,
         Exception exception,
         CancellationToken cancellationToken)
     {
-        var newAttempts = record.Attempts + 1;
+        var attempts = record.Attempts + 1;
 
-        try
-        {
-            if (newAttempts >= _outboxOptions.MaxAttempts)
-            {
-                var dead = await _store
-                    .MarkFailedAsync(
-                        record.EventId,
-                        newAttempts,
-                        nextRetryAtUtc: null,
-                        exception.Message,
-                        CancellationToken.None) // shutdown must not lose the Dead state
-                    .ConfigureAwait(false);
+        var retryAtUtc = attempts < _outboxOptions.MaxAttempts
+            ? _time.GetUtcNow().UtcDateTime.AddMilliseconds(
+                (long)_outboxOptions.BaseRetryDelayMs * Math.Pow(2, attempts - 1))
+            : (DateTime?)null;
 
-                if (dead)
-                {
-                    _logger.LogCritical(
-                        "Outbox event {EventId} ({EventType}, resource {ResourceId}) is now DEAD after {Attempts} publish attempts: {Error}",
-                        record.EventId,
-                        record.EventType,
-                        record.ResourceId,
-                        newAttempts,
-                        exception.Message);
-                }
-            }
-            else
-            {
-                // Exponential backoff: 5 s, 10 s, 20 s, … (base * 2^(n-1)).
-                var delayMs = _outboxOptions.BaseRetryDelayMs *
-                    Math.Pow(2, newAttempts - 1);
-                var nextRetryAt = _time.GetUtcNow().UtcDateTime
-                    + TimeSpan.FromMilliseconds(delayMs);
+        var lastError = exception.Message.Length > 500
+            ? exception.Message[..500]
+            : exception.Message;
 
-                await _store
-                    .MarkFailedAsync(
-                        record.EventId,
-                        newAttempts,
-                        nextRetryAt,
-                        exception.Message,
-                        cancellationToken)
-                    .ConfigureAwait(false);
-
-                _logger.LogWarning(
-                    exception,
-                    "Publish attempt {Attempts}/{MaxAttempts} for outbox event {EventId} ({EventType}) failed; retrying at {NextRetryAt:O}.",
-                    newAttempts,
-                    _outboxOptions.MaxAttempts,
-                    record.EventId,
-                    record.EventType,
-                    nextRetryAt);
-            }
-        }
-        catch (Exception storeException)
-        {
-            // The row could not be updated (e.g. the store itself is down).
-            // Log loudly and keep going: the row remains Publishing and is
-            // re-claimed after its lease expires, so the event is not lost.
-            _logger.LogError(
-                storeException,
-                "Could not record the failed publish of outbox event {EventId} on the outbox row: {Error}",
+        var recorded = await _store
+            .MarkFailedAsync(
                 record.EventId,
-                exception.Message);
+                record.ClaimId,
+                attempts,
+                retryAtUtc,
+                lastError,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        if (retryAtUtc is null)
+        {
+            _logger.LogError(
+                exception,
+                "Outbox event {EventId} exhausted {MaxAttempts} publish attempts and is now Dead. Inspect the row (lastError) and replay it on purpose (see README).",
+                record.EventId,
+                _outboxOptions.MaxAttempts);
+        }
+        else
+        {
+            _logger.LogWarning(
+                exception,
+                "Publish attempt {Attempts}/{MaxAttempts} for outbox event {EventId} ({EventType}) failed; retrying at {RetryAtUtc}.",
+                attempts,
+                _outboxOptions.MaxAttempts,
+                record.EventId,
+                record.EventType,
+                retryAtUtc.Value);
+        }
+
+        if (!recorded)
+        {
+            _logger.LogWarning(
+                "Failure record for outbox event {EventId} not applied — claim lost to another relay; the new claimant owns the retry budget now.",
+                record.EventId);
         }
     }
 }

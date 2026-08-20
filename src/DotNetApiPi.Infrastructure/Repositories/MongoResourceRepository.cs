@@ -281,14 +281,15 @@ public sealed class MongoResourceRepository : IResourceRepository
             {
                 outboxRecords.Add(new OutboxEventRecord(
                     Guid.NewGuid(),
-                    domainEvent.GetType().Name,
+                    DomainEventWireTypes.GetWireName(domainEvent.GetType()),
                     aggregate.Id,
                     domainEvent.OccurredOn,
                     OutboxEventEnvelope.SerializeEvent(domainEvent),
                     OutboxEventStatus.Pending,
                     Attempts: 0,
                     CreatedAtUtc: now,
-                    NextRetryAtUtc: null,
+                    ClaimableAtUtc: now, // claimable immediately
+                    ClaimId: Guid.Empty, // assigned when first claimed
                     LeaseUntilUtc: null,
                     PublishedAtUtc: null,
                     TopicPartition: null,

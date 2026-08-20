@@ -77,11 +77,24 @@ public sealed class OutboxEventDocument
     public DateTime CreatedAtUtc { get; set; }
 
     /// <summary>
-    /// Gets or sets the backoff gate (UTC); <c>null</c> means immediately
-    /// claimable.
+    /// Gets or sets the single claim gate (UTC): the row is claimable on
+    /// after this instant. Creation time on insert, lease expiry while
+    /// <c>Publishing</c>, backoff time after a failed attempt. One field
+    /// (instead of a nullable backoff gate plus a lease) keeps the claim
+    /// query a single index range.
     /// </summary>
-    [BsonElement("nextRetryAtUtc")]
-    public DateTime? NextRetryAtUtc { get; set; }
+    [BsonElement("claimableAtUtc")]
+    public DateTime ClaimableAtUtc { get; set; }
+
+    /// <summary>
+    /// Gets or sets the identity of the current claim (a fresh GUID set by
+    /// the claiming relay). Publish/failure updates only apply while this
+    /// value still matches, which is what makes the lease a real ownership
+    /// guarantee instead of a convention.
+    /// </summary>
+    [BsonElement("claimId")]
+    [BsonGuidRepresentation(GuidRepresentation.Standard)]
+    public Guid ClaimId { get; set; }
 
     /// <summary>
     /// Gets or sets the claim lease (UTC); a <c>Publishing</c> row whose

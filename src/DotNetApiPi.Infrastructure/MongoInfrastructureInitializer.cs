@@ -43,23 +43,51 @@ public sealed class MongoInfrastructureInitializer : IInfrastructureInitializer
             _collection.Database.DatabaseNamespace.DatabaseName,
             _collection.CollectionNamespace.CollectionName);
 
-        // Indexes are the one thing MongoDB does not create lazily. Both are
+        // Indexes are the one thing MongoDB does not create lazily. All are
         // idempotent (createIndex is a no-op when the index already exists
         // with the same specification).
         //
-        // status + createdAtUtc: the relay's working set — it scans Pending
-        // (and lease-expired Publishing) rows in creation order.
-        var statusIndexKeys = Builders<OutboxEventDocument>.IndexKeys
+        // status + claimableAtUtc: the relay's working set. The claim query
+        // is "status IN (Pending, Publishing) AND claimableAtUtc <= now" in
+        // claimableAtUtc order — this compound index serves both the filter
+        // and the sort, so a broker-outage backlog never forces a blocking
+        // in-memory sort (which has a 100 MB ceiling).
+        var claimIndexKeys = Builders<OutboxEventDocument>.IndexKeys
             .Combine(
                 Builders<OutboxEventDocument>.IndexKeys.Ascending(d => d.Status),
-                Builders<OutboxEventDocument>.IndexKeys.Ascending(d => d.CreatedAtUtc));
+                Builders<OutboxEventDocument>.IndexKeys.Ascending(d => d.ClaimableAtUtc));
 
         await _outboxStore.Collection
             .Indexes
             .CreateOneAsync(
                 new CreateIndexModel<OutboxEventDocument>(
-                    statusIndexKeys,
-                    new CreateIndexOptions { Name = "status_createdAtUtc" }),
+                    claimIndexKeys,
+                    new CreateIndexOptions { Name = "status_claimableAtUtc" }),
+                options: null,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        // TTL: published rows are terminal and only matter for replay/audit
+        // — let them age out (7 days) so the collection cannot outgrow the
+        // working set. The partial filter keeps Pending, Publishing and
+        // Dead rows indefinitely. (Created when the first Published row
+        // exists; the TTL monitor deletes only documents in the partial
+        // index.)
+        await _outboxStore.Collection
+            .Indexes
+            .CreateOneAsync(
+                new CreateIndexModel<OutboxEventDocument>(
+                    Builders<OutboxEventDocument>.IndexKeys.Ascending(d => d.PublishedAtUtc),
+                    new CreateIndexOptions<OutboxEventDocument>
+                    {
+                        Name = "publishedAtUtc_ttl",
+                        ExpireAfter = TimeSpan.FromDays(7),
+                        // Strongly-typed partial filter (driver 3.x): only
+                        // terminal Published rows enter the TTL index.
+                        PartialFilterExpression = Builders<OutboxEventDocument>.Filter.Eq(
+                            d => d.Status,
+                            OutboxEventStatus.Published)
+                    }),
                 options: null,
                 cancellationToken)
             .ConfigureAwait(false);

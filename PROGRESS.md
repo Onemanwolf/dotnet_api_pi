@@ -290,8 +290,9 @@ end on the compose stack.
   `kafka-init` (creates `resource-events`, 3 partitions, RF 1, 1 h
   retention; `auto.create.topics.enable=false`) and `kafka-data-init` (the
   image runs as `appuser` but a fresh volume is root-owned); `mongo` is now a
-  **single-node replica set without authentication** (a no-restart compose
-  stack cannot bootstrap keyFile + RS users) with one-shot `mongo-init`.
+  **single-node replica set** with one-shot `mongo-init` (first round:
+  unauthenticated; the review round switched it to an authenticated
+  keyFile replica set — see the next section).
   No `.env` variables are required anymore.
 - **Tests**: domain tests for the three new events (including
   "delete does not bump the version"); relay unit tests against an in-memory
@@ -314,13 +315,97 @@ lines with the same key, same partition and consecutive offsets
 - `apache/kafka` 4.x scripts are `.sh`-suffixed
   (`/opt/kafka/bin/kafka-topics.sh`); default user is `appuser` (uid 1000).
 - An authenticated replica set **requires** a keyFile
-  (`BadValue: security.keyFile is required...`); hence the no-auth dev
-  posture (loopback ports only).
+  (`BadValue: security.keyFile is required...`). First round shipped
+  no-auth dev (loopback only); the review round fixed this properly — see
+  next section.
 - MongoDB driver 3.x: sessions are the **first** argument of collection
   calls, `IClientSessionHandle` is `IDisposable`, no `Builders.Filter.IsNull`,
   `CreateOneIndex` overloads are obsolete, and Guid fields need
   `[BsonGuidRepresentation]` (driver default representation is
   `Unspecified` — writes fail at runtime, not compile time).
+
+## Outbox review round 2 (2026-08-20)
+
+A detailed external code review (findings O-01…O-12) of the outbox/Kafka
+work drove a second round of hardening. All findings addressed and the
+stack re-verified end to end on the compose stack.
+
+### What changed
+
+- **O-01 — MongoDB is now authenticated** (was: no-auth dev posture).
+  The keyFile bootstrap *is* expressible in compose: one-shot
+  `mongo-keyfile-init` generates the keyFile into the `mongo-keyfile`
+  named volume once (`openssl rand -base64 756`, chowned `999:999`, mode
+  `400`); `mongo` runs with `--keyFile` + `MONGO_INITDB_ROOT_USERNAME`/
+  `PASSWORD` (entrypoint creates the root user on first init); `mongo-init`
+  runs the one-time `rs.initiate` **as that authenticated root user** and
+  waits for a writable primary. Credentials: `MONGO_USER`/`MONGO_PASSWORD`
+  env (defaults `root`/`devpass123`, overridable via `.env`). Verified:
+  unauthenticated queries are rejected (`Command find requires
+  authentication`) and the API connects with
+  `mongodb://root:devpass123@mongo:27017/?replicaSet=rs0&authSource=admin`.
+- **O-02** — the uncommitted outbox/Kafka work was committed
+  (baseline `edb0fcf`) before this round started.
+- **O-03 — TTL on Published rows**: partial TTL index `publishedAtUtc_ttl`
+  (7 days, partial filter `status: Published`) — published rows age out;
+  `Pending`/`Publishing`/`Dead` rows are exempt. Partial filters in
+  driver 3.x use the generic `CreateIndexOptions<T>.PartialFilterExpression`
+  (strongly typed; the 2.x `BsonDocument` property is gone).
+- **O-04 — index-backed claim query**: the claim is now a single filter
+  `status IN (Pending, Publishing) AND claimableAtUtc <= now` sorted by
+  `claimableAtUtc` — served entirely by the compound
+  `status_claimableAtUtc` index (filter + sort), no `$or` and no blocking
+  in-memory sort (which has a 100 MB ceiling on big backlogs).
+- **O-05 — claims carry an owner token** (`claimId`, GUID assigned by the
+  claiming `FindOneAndUpdate`). `MarkPublishedAsync`/`MarkFailedAsync` are
+  conditional on `id + status=Publishing + claimId`, so a late writer whose
+  lease expired is a **detectable no-op** (returns `false`, the relay logs a
+  warning) instead of silently overwriting the row a new claimant owns. The
+  relay tolerates the lost claim; the event is re-delivered under the new
+  claim (at-least-once + `x-event-id` dedupe covers the duplicate).
+- **O-06 — fresh clock per claim/mark**: the relay reads
+  `TimeProvider.GetUtcNow()` for every claim and every mark, so leases and
+  backoff gates are measured from their own instants even when the broker
+  is degraded (a cycle-wide timestamp would expire the later rows' leases
+  mid-batch).
+- **O-07 — bounded publish concurrency**: a claimed batch is grouped by
+  `resourceId` and the groups run concurrently up to
+  `Outbox:PublishConcurrency` (default 8) under a semaphore. Per-resource
+  ordering is preserved (a resource's events stay sequential — and land in
+  the same Kafka partition), while a slow round-trip on one resource no
+  longer blocks every other resource behind it.
+- **O-08 — stable wire contract**: `eventType` is no longer a CLR type
+  name (an IDE rename would silently republish a broken contract). New
+  `DomainEventWireTypes` maps event types to stable names
+  (`resource.created.v1`, `resource.activated.v1`, `resource.archived.v1`,
+  `resource.deleted.v1`) and **throws** for unregistered types (fail-fast at
+  the publish site); the envelope gained `schemaVersion` (currently `1`).
+  Covered by `DomainEventWireTypesTests`.
+- **O-09 — single claim gate**: the nullable `nextRetryAtUtc` backoff gate
+  and the lease expired together into one non-nullable `claimableAtUtc`
+  (creation time → lease expiry while Publishing → backoff time after a
+  failed attempt), which is what makes the O-04 index-only claim possible.
+- **O-10 — dead-letter runbook**: the README now documents how to inspect
+  `Dead` rows and replay them on purpose (reset to `Pending` in one
+  `updateMany`; the relay picks them up within one poll interval).
+- **O-11 — outbox is Mongo-only, documented**: the README states plainly
+  that the SQLite/EF path never touches the outbox (no multi-document
+  transactions there; events dispatch in-process).
+- **O-12 — docs**: README/PROGRESS updated for auth, the TTL, the wire
+  contract and the new `Outbox:PublishConcurrency` knob.
+
+### Verified end to end (compose, after the changes)
+
+Fresh volumes, authenticated stack: `mongo-keyfile-init` and `mongo-init`
+exit 0 (`single-node authenticated replica set rs0 has a writable
+primary`), unauthenticated access rejected, API healthy. Full lifecycle on
+one resource again produced four consumer lines, same key/partition,
+consecutive offsets 0→3, now carrying the stable wire names and
+`schemaVersion: 1`; the `outbox_events` rows are `Published` with non-empty
+`claimId`, and the collection shows the `status_claimableAtUtc` and
+`publishedAtUtc_ttl` (7 d, partial `status: 2`) indexes. Unit tests: 187
+passing (4 new relay/contract tests, including a lost-claim scenario where
+the mark is a no-op and the event is re-delivered under the new claim).
 
 ## Run
 
@@ -337,7 +422,8 @@ Docker (API + MongoDB + Kafka + consumer):
 ```bash
 docker compose up -d --build
 # API: http://localhost:8090  (Swagger at /swagger)
-# Outbox rows:  docker compose exec mongo mongosh --quiet dotnet_api_pi --eval 'db.outbox_events.find().forEach(d=>print(d.eventType, d.status))'
+# Outbox rows (authenticated; adjust -u/-p if you override MONGO_USER/MONGO_PASSWORD):
+#   docker compose exec mongo mongosh "mongodb://root:devpass123@localhost:27017/dotnet_api_pi?authSource=admin" --quiet --eval 'db.outbox_events.find().forEach(d=>print(d.eventType, d.status))'
 # Event stream: docker compose logs -f consumer
 # Kafka from the host: kcat -b localhost:29092 -C -t resource-events
 docker compose down   # add -v to delete the mongo + kafka data volumes

@@ -8,10 +8,15 @@ namespace DotNetApiPi.Infrastructure.Outbox;
 /// <c>outbox_events</c> collection.
 /// <para>
 /// The claim is a single <c>findAndModify</c> (atomic on MongoDB), so
-/// competing relay instances never claim the same row; the publish/failure
-/// updates are conditional on the row still being <c>Publishing</c>, so a
-/// late writer (whose lease expired in the meantime) never overwrites the
-/// row a newer claimant owns.
+/// competing relay instances never claim the same row. The claim filter is
+/// one index range — <c>status IN (Pending, Publishing) AND
+/// claimableAtUtc &lt;= now</c>, ordered by <c>claimableAtUtc</c> — which
+/// the compound index serves without an in-memory sort even when a broker
+/// outage has built up a large backlog. Publishing/failure updates are
+/// conditional on the row still carrying the caller's claim id, so a late
+/// writer (whose lease expired in the meantime) never overwrites the row a
+/// newer claimant owns — and the loss is detectable (the update matches
+/// nothing) rather than inferred.
 /// </para>
 /// </summary>
 public sealed class MongoOutboxEventStore : IOutboxEventStore
@@ -26,6 +31,9 @@ public sealed class MongoOutboxEventStore : IOutboxEventStore
 
     private static readonly UpdateDefinitionBuilder<OutboxEventDocument> Update =
         Builders<OutboxEventDocument>.Update;
+
+    private static readonly SortDefinitionBuilder<OutboxEventDocument> Sort =
+        Builders<OutboxEventDocument>.Sort;
 
     private readonly IMongoCollection<OutboxEventDocument> _collection;
 
@@ -72,7 +80,8 @@ public sealed class MongoOutboxEventStore : IOutboxEventStore
                 Status = record.Status,
                 Attempts = record.Attempts,
                 CreatedAtUtc = record.CreatedAtUtc,
-                NextRetryAtUtc = record.NextRetryAtUtc,
+                ClaimableAtUtc = record.ClaimableAtUtc,
+                ClaimId = record.ClaimId,
                 LeaseUntilUtc = record.LeaseUntilUtc,
                 PublishedAtUtc = record.PublishedAtUtc,
                 TopicPartition = record.TopicPartition,
@@ -95,26 +104,30 @@ public sealed class MongoOutboxEventStore : IOutboxEventStore
         int leaseSeconds,
         CancellationToken cancellationToken)
     {
-        // Publishable: Pending rows whose backoff gate has passed (or has no
-        // gate), or Publishing rows whose lease expired (crash leftover).
-        var filter = Filter.Or(
-            Filter.And(
-                Filter.Eq(d => d.Status, OutboxEventStatus.Pending),
-                Filter.Or(
-                    Filter.Eq(d => d.NextRetryAtUtc, (DateTime?)null),
-                    Filter.Lte(d => d.NextRetryAtUtc, now))),
-            Filter.And(
-                Filter.Eq(d => d.Status, OutboxEventStatus.Publishing),
-                Filter.Lte(d => d.LeaseUntilUtc, now)));
+        // Publishable in one predicate: Pending rows whose backoff gate has
+        // passed and Publishing rows whose lease expired (crash leftover).
+        // Both conditions live in claimableAtUtc, so this is a single index
+        // range — no $or, no blocking in-memory sort — and the sort matches
+        // the index order, so "oldest claimable event first" is provided by
+        // the {status, claimableAtUtc} index itself.
+        var filter = Filter.And(
+            Filter.In(
+                d => d.Status,
+                new[] { OutboxEventStatus.Pending, OutboxEventStatus.Publishing }),
+            Filter.Lte(d => d.ClaimableAtUtc, now));
 
+        // Claim = take ownership: fresh claim id, lease and claim gate both
+        // pushed to the lease expiry.
+        var leaseUntil = now.AddSeconds(leaseSeconds);
         var update = Update
             .Set(d => d.Status, OutboxEventStatus.Publishing)
-            .Set(d => d.LeaseUntilUtc, now.AddSeconds(leaseSeconds))
+            .Set(d => d.ClaimId, Guid.NewGuid())
+            .Set(d => d.LeaseUntilUtc, leaseUntil)
+            .Set(d => d.ClaimableAtUtc, leaseUntil)
             .Set(d => d.LastError, null);
 
-        // A single atomic find-and-update (findAndModify) ordered by
-        // creation time (id as tie-break): exactly one relay instance can
-        // claim a given row, and the oldest event is always claimed first.
+        // A single atomic find-and-update (findAndModify): exactly one relay
+        // instance can claim a given row.
         var claimed = await _collection
             .FindOneAndUpdateAsync(
                 filter,
@@ -122,9 +135,9 @@ public sealed class MongoOutboxEventStore : IOutboxEventStore
                 new FindOneAndUpdateOptions<OutboxEventDocument, OutboxEventDocument>
                 {
                     ReturnDocument = ReturnDocument.After,
-                    Sort = Builders<OutboxEventDocument>.Sort.Combine(
-                        Builders<OutboxEventDocument>.Sort.Ascending(d => d.CreatedAtUtc),
-                        Builders<OutboxEventDocument>.Sort.Ascending(d => d.Id))
+                    Sort = Sort.Combine(
+                        Sort.Ascending(d => d.ClaimableAtUtc),
+                        Sort.Ascending(d => d.Id))
                 },
                 cancellationToken)
             .ConfigureAwait(false);
@@ -134,36 +147,27 @@ public sealed class MongoOutboxEventStore : IOutboxEventStore
             return null;
         }
 
-        return new OutboxEventRecord(
-            claimed.Id,
-            claimed.EventType,
-            claimed.ResourceId,
-            claimed.OccurredOnUtc,
-            claimed.PayloadJson,
-            claimed.Status,
-            claimed.Attempts,
-            claimed.CreatedAtUtc,
-            claimed.NextRetryAtUtc,
-            claimed.LeaseUntilUtc,
-            claimed.PublishedAtUtc,
-            claimed.TopicPartition,
-            claimed.Offset,
-            claimed.LastError);
+        return ToRecord(claimed);
     }
 
     /// <inheritdoc />
     public async Task<bool> MarkPublishedAsync(
         Guid eventId,
+        Guid claimId,
         int partition,
         long offset,
         DateTime publishedAtUtc,
         CancellationToken cancellationToken)
     {
+        // Conditional on the row still being Publishing AND still owned by
+        // this claim: a lease-expired takeover by another relay makes this
+        // a no-op (MatchedCount 0) instead of an overwrite.
         var result = await _collection
             .UpdateOneAsync(
                 Filter.And(
                     Filter.Eq(d => d.Id, eventId),
-                    Filter.Eq(d => d.Status, OutboxEventStatus.Publishing)),
+                    Filter.Eq(d => d.Status, OutboxEventStatus.Publishing),
+                    Filter.Eq(d => d.ClaimId, claimId)),
                 Update
                     .Set(d => d.Status, OutboxEventStatus.Published)
                     .Set(d => d.PublishedAtUtc, publishedAtUtc)
@@ -181,32 +185,60 @@ public sealed class MongoOutboxEventStore : IOutboxEventStore
     /// <inheritdoc />
     public async Task<bool> MarkFailedAsync(
         Guid eventId,
+        Guid claimId,
         int newAttempts,
-        DateTime? nextRetryAtUtc,
+        DateTime? retryAtUtc,
         string? lastError,
         CancellationToken cancellationToken)
     {
         // null gate => the retry budget is exhausted => Dead; otherwise the
-        // row goes back to Pending and is claimable after the backoff.
-        var status = nextRetryAtUtc is null
+        // row goes back to Pending, claimable again after the backoff.
+        var status = retryAtUtc is null
             ? OutboxEventStatus.Dead
             : OutboxEventStatus.Pending;
+
+        var update = Update
+            .Set(d => d.Status, status)
+            .Set(d => d.Attempts, newAttempts)
+            .Set(d => d.LeaseUntilUtc, null)
+            .Set(d => d.LastError, lastError);
+
+        // The backoff gate only exists while the row is retriable; Dead rows
+        // are terminal (operators replay them on purpose — see README).
+        if (retryAtUtc is not null)
+        {
+            update = update.Set(d => d.ClaimableAtUtc, retryAtUtc.Value);
+        }
 
         var result = await _collection
             .UpdateOneAsync(
                 Filter.And(
                     Filter.Eq(d => d.Id, eventId),
-                    Filter.Eq(d => d.Status, OutboxEventStatus.Publishing)),
-                Update
-                    .Set(d => d.Status, status)
-                    .Set(d => d.Attempts, newAttempts)
-                    .Set(d => d.NextRetryAtUtc, nextRetryAtUtc)
-                    .Set(d => d.LeaseUntilUtc, null)
-                    .Set(d => d.LastError, lastError),
+                    Filter.Eq(d => d.Status, OutboxEventStatus.Publishing),
+                    Filter.Eq(d => d.ClaimId, claimId)),
+                update,
                 null,
                 cancellationToken)
             .ConfigureAwait(false);
 
         return result.MatchedCount > 0;
     }
+
+    private static OutboxEventRecord ToRecord(OutboxEventDocument document)
+        => new(
+            document.Id,
+            document.EventType,
+            document.ResourceId,
+            document.OccurredOnUtc,
+            document.PayloadJson,
+            document.Status,
+            document.Attempts,
+            document.CreatedAtUtc,
+            document.ClaimableAtUtc,
+            document.ClaimId,
+            document.LeaseUntilUtc,
+            document.PublishedAtUtc,
+            document.TopicPartition,
+            document.Offset,
+            document.LastError);
 }
