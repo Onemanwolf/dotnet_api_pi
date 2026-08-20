@@ -1,0 +1,224 @@
+{
+  "format": 1,
+  "restore": {
+    "/Users/timoleson/Desktop/Repos/dotnet_api_pi/src/DotNetApiPi.Infrastructure/DotNetApiPi.Infrastructure.csproj": {}
+  },
+  "projects": {
+    "/Users/timoleson/Desktop/Repos/dotnet_api_pi/src/DotNetApiPi.Application/DotNetApiPi.Application.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "/Users/timoleson/Desktop/Repos/dotnet_api_pi/src/DotNetApiPi.Application/DotNetApiPi.Application.csproj",
+        "projectName": "DotNetApiPi.Application",
+        "projectPath": "/Users/timoleson/Desktop/Repos/dotnet_api_pi/src/DotNetApiPi.Application/DotNetApiPi.Application.csproj",
+        "packagesPath": "/Users/timoleson/.nuget/packages/",
+        "outputPath": "/Users/timoleson/Desktop/Repos/dotnet_api_pi/src/DotNetApiPi.Application/obj/",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "/Users/timoleson/.nuget/NuGet/NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net9.0"
+        ],
+        "sources": {
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net9.0": {
+            "targetAlias": "net9.0",
+            "projectReferences": {
+              "/Users/timoleson/Desktop/Repos/dotnet_api_pi/src/DotNetApiPi.Domain/DotNetApiPi.Domain.csproj": {
+                "projectPath": "/Users/timoleson/Desktop/Repos/dotnet_api_pi/src/DotNetApiPi.Domain/DotNetApiPi.Domain.csproj"
+              }
+            }
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        },
+        "restoreAuditProperties": {
+          "enableAudit": "true",
+          "auditLevel": "low",
+          "auditMode": "direct"
+        },
+        "SdkAnalysisLevel": "9.0.300"
+      },
+      "frameworks": {
+        "net9.0": {
+          "targetAlias": "net9.0",
+          "dependencies": {
+            "Microsoft.Extensions.DependencyInjection.Abstractions": {
+              "target": "Package",
+              "version": "[9.0.0, )"
+            }
+          },
+          "imports": [
+            "net461",
+            "net462",
+            "net47",
+            "net471",
+            "net472",
+            "net48",
+            "net481"
+          ],
+          "assetTargetFallback": true,
+          "warn": true,
+          "frameworkReferences": {
+            "Microsoft.NETCore.App": {
+              "privateAssets": "all"
+            }
+          },
+          "runtimeIdentifierGraphPath": "/usr/local/share/dotnet/sdk/9.0.306/PortableRuntimeIdentifierGraph.json"
+        }
+      }
+    },
+    "/Users/timoleson/Desktop/Repos/dotnet_api_pi/src/DotNetApiPi.Domain/DotNetApiPi.Domain.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "/Users/timoleson/Desktop/Repos/dotnet_api_pi/src/DotNetApiPi.Domain/DotNetApiPi.Domain.csproj",
+        "projectName": "DotNetApiPi.Domain",
+        "projectPath": "/Users/timoleson/Desktop/Repos/dotnet_api_pi/src/DotNetApiPi.Domain/DotNetApiPi.Domain.csproj",
+        "packagesPath": "/Users/timoleson/.nuget/packages/",
+        "outputPath": "/Users/timoleson/Desktop/Repos/dotnet_api_pi/src/DotNetApiPi.Domain/obj/",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "/Users/timoleson/.nuget/NuGet/NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net9.0"
+        ],
+        "sources": {
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net9.0": {
+            "targetAlias": "net9.0",
+            "projectReferences": {}
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        },
+        "restoreAuditProperties": {
+          "enableAudit": "true",
+          "auditLevel": "low",
+          "auditMode": "direct"
+        },
+        "SdkAnalysisLevel": "9.0.300"
+      },
+      "frameworks": {
+        "net9.0": {
+          "targetAlias": "net9.0",
+          "imports": [
+            "net461",
+            "net462",
+            "net47",
+            "net471",
+            "net472",
+            "net48",
+            "net481"
+          ],
+          "assetTargetFallback": true,
+          "warn": true,
+          "frameworkReferences": {
+            "Microsoft.NETCore.App": {
+              "privateAssets": "all"
+            }
+          },
+          "runtimeIdentifierGraphPath": "/usr/local/share/dotnet/sdk/9.0.306/PortableRuntimeIdentifierGraph.json"
+        }
+      }
+    },
+    "/Users/timoleson/Desktop/Repos/dotnet_api_pi/src/DotNetApiPi.Infrastructure/DotNetApiPi.Infrastructure.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "/Users/timoleson/Desktop/Repos/dotnet_api_pi/src/DotNetApiPi.Infrastructure/DotNetApiPi.Infrastructure.csproj",
+        "projectName": "DotNetApiPi.Infrastructure",
+        "projectPath": "/Users/timoleson/Desktop/Repos/dotnet_api_pi/src/DotNetApiPi.Infrastructure/DotNetApiPi.Infrastructure.csproj",
+        "packagesPath": "/Users/timoleson/.nuget/packages/",
+        "outputPath": "/Users/timoleson/Desktop/Repos/dotnet_api_pi/src/DotNetApiPi.Infrastructure/obj/",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "/Users/timoleson/.nuget/NuGet/NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net9.0"
+        ],
+        "sources": {
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net9.0": {
+            "targetAlias": "net9.0",
+            "projectReferences": {
+              "/Users/timoleson/Desktop/Repos/dotnet_api_pi/src/DotNetApiPi.Application/DotNetApiPi.Application.csproj": {
+                "projectPath": "/Users/timoleson/Desktop/Repos/dotnet_api_pi/src/DotNetApiPi.Application/DotNetApiPi.Application.csproj"
+              },
+              "/Users/timoleson/Desktop/Repos/dotnet_api_pi/src/DotNetApiPi.Domain/DotNetApiPi.Domain.csproj": {
+                "projectPath": "/Users/timoleson/Desktop/Repos/dotnet_api_pi/src/DotNetApiPi.Domain/DotNetApiPi.Domain.csproj"
+              }
+            }
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        },
+        "restoreAuditProperties": {
+          "enableAudit": "true",
+          "auditLevel": "low",
+          "auditMode": "direct"
+        },
+        "SdkAnalysisLevel": "9.0.300"
+      },
+      "frameworks": {
+        "net9.0": {
+          "targetAlias": "net9.0",
+          "dependencies": {
+            "Microsoft.EntityFrameworkCore": {
+              "target": "Package",
+              "version": "[9.0.0, )"
+            },
+            "Microsoft.EntityFrameworkCore.Sqlite": {
+              "target": "Package",
+              "version": "[9.0.0, )"
+            },
+            "Microsoft.Extensions.DependencyInjection.Abstractions": {
+              "target": "Package",
+              "version": "[9.0.0, )"
+            },
+            "Microsoft.Extensions.Logging.Abstractions": {
+              "target": "Package",
+              "version": "[9.0.0, )"
+            },
+            "MongoDB.Driver": {
+              "target": "Package",
+              "version": "[3.11.0, )"
+            }
+          },
+          "imports": [
+            "net461",
+            "net462",
+            "net47",
+            "net471",
+            "net472",
+            "net48",
+            "net481"
+          ],
+          "assetTargetFallback": true,
+          "warn": true,
+          "frameworkReferences": {
+            "Microsoft.NETCore.App": {
+              "privateAssets": "all"
+            }
+          },
+          "runtimeIdentifierGraphPath": "/usr/local/share/dotnet/sdk/9.0.306/PortableRuntimeIdentifierGraph.json"
+        }
+      }
+    }
+  }
+}

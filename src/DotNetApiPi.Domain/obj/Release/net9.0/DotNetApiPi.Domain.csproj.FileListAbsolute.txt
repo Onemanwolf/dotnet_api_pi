@@ -1,0 +1,11 @@
+/Users/timoleson/Desktop/Repos/dotnet_api_pi/src/DotNetApiPi.Domain/bin/Release/net9.0/DotNetApiPi.Domain.deps.json
+/Users/timoleson/Desktop/Repos/dotnet_api_pi/src/DotNetApiPi.Domain/bin/Release/net9.0/DotNetApiPi.Domain.dll
+/Users/timoleson/Desktop/Repos/dotnet_api_pi/src/DotNetApiPi.Domain/bin/Release/net9.0/DotNetApiPi.Domain.pdb
+/Users/timoleson/Desktop/Repos/dotnet_api_pi/src/DotNetApiPi.Domain/obj/Release/net9.0/DotNetApiPi.Domain.GeneratedMSBuildEditorConfig.editorconfig
+/Users/timoleson/Desktop/Repos/dotnet_api_pi/src/DotNetApiPi.Domain/obj/Release/net9.0/DotNetApiPi.Domain.AssemblyInfoInputs.cache
+/Users/timoleson/Desktop/Repos/dotnet_api_pi/src/DotNetApiPi.Domain/obj/Release/net9.0/DotNetApiPi.Domain.AssemblyInfo.cs
+/Users/timoleson/Desktop/Repos/dotnet_api_pi/src/DotNetApiPi.Domain/obj/Release/net9.0/DotNetApiPi.Domain.csproj.CoreCompileInputs.cache
+/Users/timoleson/Desktop/Repos/dotnet_api_pi/src/DotNetApiPi.Domain/obj/Release/net9.0/DotNetApiPi.Domain.dll
+/Users/timoleson/Desktop/Repos/dotnet_api_pi/src/DotNetApiPi.Domain/obj/Release/net9.0/refint/DotNetApiPi.Domain.dll
+/Users/timoleson/Desktop/Repos/dotnet_api_pi/src/DotNetApiPi.Domain/obj/Release/net9.0/DotNetApiPi.Domain.pdb
+/Users/timoleson/Desktop/Repos/dotnet_api_pi/src/DotNetApiPi.Domain/obj/Release/net9.0/ref/DotNetApiPi.Domain.dll
