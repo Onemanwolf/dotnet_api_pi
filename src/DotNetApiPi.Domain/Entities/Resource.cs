@@ -14,6 +14,13 @@ namespace DotNetApiPi.Domain.Entities;
 /// expressive modeling (value objects, invariants, lifecycle transitions and
 /// domain events) without being tied to a specific business domain.
 /// </para>
+/// <para>
+/// <c>Archived</c> is a terminal state: once archived, the resource is
+/// immutable and every mutator (<see cref="Rename"/>,
+/// <see cref="SetDescription"/>, <see cref="AddTag"/>,
+/// <see cref="SetTags"/>) throws <see cref="DomainException"/>
+/// (HTTP 409 via the application layer's exception mapping).
+/// </para>
 /// </summary>
 public sealed class Resource : AggregateRoot<Guid>
 {
@@ -26,8 +33,10 @@ public sealed class Resource : AggregateRoot<Guid>
 
     /// <summary>
     /// The maximum number of tags a resource may carry. Together with
-    /// <see cref="ResourceTag.MaxLength"/> this keeps the serialized tag blob
-    /// well within the persistence layer's column cap.
+    /// <see cref="ResourceTag.MaxLength"/> (64) this bounds the worst-case
+    /// serialized tag blob at 50 × 64 = 3,200 characters plus JSON
+    /// punctuation and escaping (≈3,400 characters), which fits within the
+    /// persistence layer's 4,096-character cap on the tags column.
     /// </summary>
     public const int MaxTagCount = 50;
 
@@ -141,9 +150,13 @@ public sealed class Resource : AggregateRoot<Guid>
     /// Renames the resource.
     /// </summary>
     /// <param name="name">The new name of the resource.</param>
+    /// <exception cref="DomainException">
+    /// Thrown when the resource is archived.
+    /// </exception>
     public void Rename(ResourceName name)
     {
         ArgumentNullException.ThrowIfNull(name);
+        EnsureMutable();
 
         if (Name == name)
         {
@@ -164,8 +177,12 @@ public sealed class Resource : AggregateRoot<Guid>
     /// <exception cref="DomainInputException">
     /// Thrown when the description exceeds <see cref="MaxDescriptionLength"/>.
     /// </exception>
+    /// <exception cref="DomainException">
+    /// Thrown when the resource is archived.
+    /// </exception>
     public void SetDescription(string? description)
     {
+        EnsureMutable();
         Description = ValidateDescription(description);
     }
 
@@ -211,9 +228,13 @@ public sealed class Resource : AggregateRoot<Guid>
     /// <exception cref="DomainInputException">
     /// Thrown when the resource already has <see cref="MaxTagCount"/> tags.
     /// </exception>
+    /// <exception cref="DomainException">
+    /// Thrown when the resource is archived.
+    /// </exception>
     public void AddTag(ResourceTag tag)
     {
         ArgumentNullException.ThrowIfNull(tag);
+        EnsureMutable();
 
         if (Tags.Contains(tag))
         {
@@ -236,9 +257,31 @@ public sealed class Resource : AggregateRoot<Guid>
     /// <exception cref="DomainInputException">
     /// Thrown when the collection holds more than <see cref="MaxTagCount"/> distinct tags.
     /// </exception>
+    /// <exception cref="DomainException">
+    /// Thrown when the resource is archived.
+    /// </exception>
     public void SetTags(IEnumerable<ResourceTag>? tags)
     {
+        EnsureMutable();
         Tags = NormalizeTags(tags);
+    }
+
+    /// <summary>
+    /// State guard: archived resources are immutable.
+    /// <para>
+    /// Called before input validation on every mutator so that an archived
+    /// resource is always rejected with <see cref="DomainException"/>
+    /// (HTTP 409), even when the supplied input would also be invalid
+    /// (<see cref="DomainInputException"/> / HTTP 400). Null-argument checks
+    /// (a caller programming error) still precede this guard.
+    /// </para>
+    /// </summary>
+    private void EnsureMutable()
+    {
+        if (Status == ResourceStatus.Archived)
+        {
+            throw new DomainException("Archived resources are immutable.");
+        }
     }
 
     /// <summary>

@@ -91,7 +91,10 @@ public class ApiDbContext : DbContext
                 tags => SerializeTags(tags),
                 value => DeserializeTags(value))
             .IsRequired()
-            .HasMaxLength(2048);
+            // 4,096 covers the domain's worst-case tag blob (50 tags × 64
+            // characters = 3,200 plus JSON punctuation/escaping, ≈3,400) with
+            // headroom — see Resource.MaxTagCount and ResourceTag.MaxLength.
+            .HasMaxLength(4096);
     }
 
     /// <inheritdoc />

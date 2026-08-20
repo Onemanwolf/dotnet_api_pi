@@ -176,6 +176,110 @@ public sealed class ResourceTests
         Assert.Single(resource.Tags);
     }
 
+    #region Archived resources are immutable (terminal state)
+
+    /// <summary>
+    /// Builds a resource in the terminal (archived) state: Draft → Active →
+    /// Archived.
+    /// </summary>
+    private static Resource CreateArchived()
+    {
+        var resource = Resource.Create(new ResourceName("My Resource"), tags: [new ResourceTag("cloud")]);
+        resource.Activate();
+        resource.Archive();
+        return resource;
+    }
+
+    [Fact]
+    public void Rename_OnArchivedResource_ThrowsDomainException()
+    {
+        var resource = CreateArchived();
+
+        var exception = Assert.Throws<DomainException>(
+            () => resource.Rename(new ResourceName("Renamed After Archive")));
+
+        Assert.Contains("Archived", exception.Message);
+        Assert.Equal("My Resource", resource.Name.Value); // state unchanged
+    }
+
+    [Fact]
+    public void SetDescription_OnArchivedResource_ThrowsDomainException()
+    {
+        var resource = CreateArchived();
+
+        var exception = Assert.Throws<DomainException>(
+            () => resource.SetDescription("Description after archive"));
+
+        Assert.Contains("Archived", exception.Message);
+        Assert.Null(resource.Description); // state unchanged
+    }
+
+    [Fact]
+    public void SetTags_OnArchivedResource_ThrowsDomainException()
+    {
+        var resource = CreateArchived();
+
+        var exception = Assert.Throws<DomainException>(
+            () => resource.SetTags([new ResourceTag("late")]));
+
+        Assert.Contains("Archived", exception.Message);
+        Assert.Single(resource.Tags); // state unchanged (the guard fired before the input check)
+    }
+
+    [Fact]
+    public void AddTag_OnArchivedResource_ThrowsDomainException()
+    {
+        var resource = CreateArchived();
+
+        var exception = Assert.Throws<DomainException>(
+            () => resource.AddTag(new ResourceTag("late")));
+
+        Assert.Contains("Archived", exception.Message);
+        Assert.Single(resource.Tags); // state unchanged
+    }
+
+    /// <summary>
+    /// The archived guard takes precedence over input validation: renaming an
+    /// archived resource with an over-long name must fail as a state conflict
+    /// (409), not as bad input (400).
+    /// </summary>
+    [Fact]
+    public void Mutator_OnArchivedResource_StateGuardWinsOverInputValidation()
+    {
+        var resource = CreateArchived();
+
+        var exception = Assert.Throws<DomainException>(
+            () => resource.SetDescription(new string('d', Resource.MaxDescriptionLength + 1)));
+
+        Assert.IsNotType<DomainInputException>(exception);
+        Assert.Contains("Archived", exception.Message);
+    }
+
+    /// <summary>
+    /// Draft and Active resources remain fully mutable: the guard only applies
+    /// in the terminal (archived) state.
+    /// </summary>
+    [Fact]
+    public void Mutators_OnActiveResource_AreStillAllowed()
+    {
+        var resource = Resource.Create(new ResourceName("Old Name"));
+        resource.Activate();
+        Assert.Equal(ResourceStatus.Active, resource.Status);
+
+        resource.Rename(new ResourceName("New Name"));
+        resource.SetDescription("New description");
+        resource.SetTags([new ResourceTag("a"), new ResourceTag("b")]);
+        resource.AddTag(new ResourceTag("c"));
+
+        Assert.Equal("New Name", resource.Name.Value);
+        Assert.Equal("New description", resource.Description);
+        Assert.Equal(
+            new[] { "a", "b", "c" },
+            resource.Tags.Select(static tag => tag.Value).ToArray());
+    }
+
+    #endregion
+
     [Fact]
     public void AddTag_AtMaxTagCount_ThrowsDomainInputException()
     {
