@@ -1,0 +1,34 @@
+<Project>
+  <!-- Central Package Management: package versions live here, not in the
+       individual .csproj files (audit finding F-13). -->
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Microsoft first-party: pinned to the current 10.0.x servicing line -->
+    <PackageVersion Include="Microsoft.AspNetCore.Mvc.Testing" Version="10.0.11" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore" Version="10.0.11" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.11" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.11" />
+    <PackageVersion Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.11" />
+    <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.11" />
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.9.0" />
+
+    <!-- Persistence / third-party -->
+    <PackageVersion Include="MongoDB.Driver" Version="3.11.0" />
+    <PackageVersion Include="Moq" Version="4.20.72" />
+    <PackageVersion Include="Swashbuckle.AspNetCore" Version="10.2.3" />
+
+    <!-- Observability (OpenTelemetry) -->
+    <PackageVersion Include="OpenTelemetry.Extensions.Hosting" Version="1.17.0" />
+    <PackageVersion Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.17.0" />
+    <PackageVersion Include="OpenTelemetry.Instrumentation.Http" Version="1.17.0" />
+    <PackageVersion Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.17.0" />
+
+    <!-- Testing -->
+    <PackageVersion Include="coverlet.collector" Version="10.0.1" />
+    <PackageVersion Include="xunit" Version="2.9.3" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+</Project>
