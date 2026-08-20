@@ -1,0 +1,24 @@
+## .NET build artifacts
+bin/
+obj/
+*.user
+*.suo
+
+## Local databases (SQLite)
+*.db
+*.db-shm
+*.db-wal
+
+## Local environment files (see .env.example)
+.env
+
+## Editor / IDE
+.vs/
+.idea/
+*.swp
+.DS_Store
+
+## Test / coverage output
+TestResults/
+coverage*.xml
+*.coveragexml
