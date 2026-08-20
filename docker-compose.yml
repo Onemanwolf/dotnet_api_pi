@@ -23,6 +23,10 @@ services:
       # configured to listen on in the Dockerfile). Adjust if 8090 is taken.
       - "8090:8080"
     environment:
+      # Development keeps the Swagger UI (and developer-friendly error
+      # details) enabled; the API listens on 8080 inside the container
+      # (see src/DotNetApiPi.Api/Dockerfile).
+      ASPNETCORE_ENVIRONMENT: Development
       Storage__Provider: mongo
       # The root user is created in the admin database by
       # MONGO_INITDB_ROOT_*, hence authSource=admin.
