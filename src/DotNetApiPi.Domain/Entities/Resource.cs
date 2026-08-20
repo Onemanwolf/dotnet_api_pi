@@ -228,13 +228,18 @@ public sealed class Resource : AggregateRoot<Guid>
     }
 
     /// <summary>
-    /// Activates the resource. Only a resource in the draft state may be
-    /// activated.
+    /// Activates the resource and raises a <see cref="ResourceActivatedEvent"/>.
+    /// Only a resource in the draft state may be activated.
     /// </summary>
+    /// <param name="timeProvider">
+    /// An optional <see cref="TimeProvider"/> used to stamp the raised event.
+    /// Defaults to <see cref="TimeProvider.System"/>; tests may supply a
+    /// fixed clock.
+    /// </param>
     /// <exception cref="DomainException">
     /// Thrown when the resource is not in the draft state.
     /// </exception>
-    public void Activate()
+    public void Activate(TimeProvider? timeProvider = null)
     {
         if (Status != ResourceStatus.Draft)
         {
@@ -244,15 +249,25 @@ public sealed class Resource : AggregateRoot<Guid>
 
         Status = ResourceStatus.Active;
         Version++;
+        AddDomainEvent(new ResourceActivatedEvent(
+            Id,
+            (timeProvider ?? TimeProvider.System).GetUtcNow().UtcDateTime));
     }
 
     /// <summary>
-    /// Archives the resource. Only an active resource may be archived.
+    /// Archives the resource (terminal state) and raises a
+    /// <see cref="ResourceArchivedEvent"/>. Only an active resource may be
+    /// archived.
     /// </summary>
+    /// <param name="timeProvider">
+    /// An optional <see cref="TimeProvider"/> used to stamp the raised event.
+    /// Defaults to <see cref="TimeProvider.System"/>; tests may supply a
+    /// fixed clock.
+    /// </param>
     /// <exception cref="DomainException">
     /// Thrown when the resource is not in the active state.
     /// </exception>
-    public void Archive()
+    public void Archive(TimeProvider? timeProvider = null)
     {
         if (Status != ResourceStatus.Active)
         {
@@ -262,6 +277,31 @@ public sealed class Resource : AggregateRoot<Guid>
 
         Status = ResourceStatus.Archived;
         Version++;
+        AddDomainEvent(new ResourceArchivedEvent(
+            Id,
+            (timeProvider ?? TimeProvider.System).GetUtcNow().UtcDateTime));
+    }
+
+    /// <summary>
+    /// Stages the deletion of the resource by raising a
+    /// <see cref="ResourceDeletedEvent"/>. Deletion is a remove, not a state
+    /// change: the aggregate's version is deliberately <em>not</em> bumped
+    /// (the remove path is version-guarded via the version loaded in this
+    /// unit of work, mirroring the persistence layer's compare-and-swap
+    /// guard). The event is persisted through the outbox within the same
+    /// transaction that removes the aggregate, so consumers are informed of
+    /// the deletion even though the document no longer exists afterwards.
+    /// </summary>
+    /// <param name="timeProvider">
+    /// An optional <see cref="TimeProvider"/> used to stamp the raised event.
+    /// Defaults to <see cref="TimeProvider.System"/>; tests may supply a
+    /// fixed clock.
+    /// </param>
+    public void Delete(TimeProvider? timeProvider = null)
+    {
+        AddDomainEvent(new ResourceDeletedEvent(
+            Id,
+            (timeProvider ?? TimeProvider.System).GetUtcNow().UtcDateTime));
     }
 
     /// <summary>

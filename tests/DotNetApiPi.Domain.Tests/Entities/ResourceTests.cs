@@ -126,7 +126,7 @@ public sealed class ResourceTests
         var resource = Resource.Create(new ResourceName("My Resource"));
         resource.Activate();
 
-        var exception = Assert.Throws<DomainException>(resource.Activate);
+        var exception = Assert.Throws<DomainException>(() => resource.Activate());
 
         Assert.Contains("Draft", exception.Message);
     }
@@ -138,7 +138,7 @@ public sealed class ResourceTests
         resource.Activate();
         resource.Archive();
 
-        var exception = Assert.Throws<DomainException>(resource.Activate);
+        var exception = Assert.Throws<DomainException>(() => resource.Activate());
 
         Assert.Contains("Archived", exception.Message);
     }
@@ -159,7 +159,7 @@ public sealed class ResourceTests
     {
         var resource = Resource.Create(new ResourceName("My Resource"));
 
-        var exception = Assert.Throws<DomainException>(resource.Archive);
+        var exception = Assert.Throws<DomainException>(() => resource.Archive());
 
         Assert.Contains("Draft", exception.Message);
     }
@@ -310,5 +310,63 @@ public sealed class ResourceTests
         IHasDomainEvents marker = resource;
 
         Assert.NotEmpty(marker.DomainEvents);
+    }
+
+    [Fact]
+    public void Activate_RaisesResourceActivatedEvent_WithFixedClock()
+    {
+        var fixedTime = new DateTimeOffset(2021, 2, 3, 4, 5, 6, TimeSpan.Zero);
+        var resource = Resource.Create(new ResourceName("My Resource"));
+
+        resource.Activate(timeProvider: new FixedTimeProvider(fixedTime));
+
+        Assert.Equal(ResourceStatus.Active, resource.Status);
+
+        var @event = Assert.IsType<ResourceActivatedEvent>(
+            resource.DomainEvents.OfType<ResourceActivatedEvent>().Single());
+
+        Assert.Equal(resource.Id, @event.ResourceId);
+        Assert.Equal(fixedTime.UtcDateTime, @event.OccurredOn);
+    }
+
+    [Fact]
+    public void Archive_RaisesResourceArchivedEvent_WithFixedClock()
+    {
+        var fixedTime = new DateTimeOffset(2021, 2, 3, 4, 5, 6, TimeSpan.Zero);
+        var resource = Resource.Create(new ResourceName("My Resource"));
+        resource.Activate();
+
+        resource.Archive(timeProvider: new FixedTimeProvider(fixedTime));
+
+        Assert.Equal(ResourceStatus.Archived, resource.Status);
+
+        var @event = Assert.IsType<ResourceArchivedEvent>(
+            resource.DomainEvents.OfType<ResourceArchivedEvent>().Single());
+
+        Assert.Equal(resource.Id, @event.ResourceId);
+        Assert.Equal(fixedTime.UtcDateTime, @event.OccurredOn);
+    }
+
+    [Fact]
+    public void Delete_RaisesResourceDeletedEvent_WithoutVersionBump()
+    {
+        var fixedTime = new DateTimeOffset(2021, 2, 3, 4, 5, 6, TimeSpan.Zero);
+        var resource = Resource.Create(new ResourceName("My Resource"));
+        resource.Activate();
+
+        var versionBeforeDelete = resource.Version;
+
+        resource.Delete(timeProvider: new FixedTimeProvider(fixedTime));
+
+        // Deletion is a remove, not a state change: the version is left
+        // untouched (the remove is guarded by the version loaded in the
+        // unit of work).
+        Assert.Equal(versionBeforeDelete, resource.Version);
+
+        var @event = Assert.IsType<ResourceDeletedEvent>(
+            resource.DomainEvents.OfType<ResourceDeletedEvent>().Single());
+
+        Assert.Equal(resource.Id, @event.ResourceId);
+        Assert.Equal(fixedTime.UtcDateTime, @event.OccurredOn);
     }
 }

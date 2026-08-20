@@ -13,8 +13,13 @@
          out of the published app. -->
     <PackageReference Include="Microsoft.EntityFrameworkCore.Design" PrivateAssets="all" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Binder" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
     <PackageReference Include="MongoDB.Driver" />
+    <!-- Kafka producer for the transactional outbox relay. -->
+    <PackageReference Include="Confluent.Kafka" />
   </ItemGroup>
 
   <PropertyGroup>

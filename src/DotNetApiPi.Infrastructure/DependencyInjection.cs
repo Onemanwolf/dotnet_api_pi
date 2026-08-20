@@ -2,10 +2,13 @@ using DotNetApiPi.Application.Common;
 using DotNetApiPi.Domain.Events;
 using DotNetApiPi.Domain.Repositories;
 using DotNetApiPi.Infrastructure.EventHandlers;
+using DotNetApiPi.Infrastructure.Kafka;
+using DotNetApiPi.Infrastructure.Outbox;
 using DotNetApiPi.Infrastructure.Persistence;
 using DotNetApiPi.Infrastructure.Persistence.Mongo;
 using DotNetApiPi.Infrastructure.Repositories;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using MongoDB.Driver;
 
@@ -24,10 +27,17 @@ public static class DependencyInjection
     /// </summary>
     /// <param name="services">The service collection to add the services to.</param>
     /// <param name="options">The persistence options (provider and connection details).</param>
+    /// <param name="configuration">
+    /// An optional configuration source for the <c>Kafka</c> and
+    /// <c>Outbox</c> sections (used by the MongoDB provider). <c>null</c>
+    /// disables the outbox relay, which is the right default for tests and
+    /// callers that do not run a Kafka broker.
+    /// </param>
     /// <returns>The same service collection, to enable method chaining.</returns>
     public static IServiceCollection AddInfrastructure(
         this IServiceCollection services,
-        PersistenceOptions options)
+        PersistenceOptions options,
+        IConfiguration? configuration = null)
     {
         ArgumentNullException.ThrowIfNull(services);
         ArgumentNullException.ThrowIfNull(options);
@@ -43,6 +53,15 @@ public static class DependencyInjection
         services.AddSingleton<
             IDomainEventSubscriber<ResourceCreatedEvent>,
             ResourceCreatedEventLogSubscriber>();
+        services.AddSingleton<
+            IDomainEventSubscriber<ResourceActivatedEvent>,
+            ResourceLifecycleEventLogSubscriber>();
+        services.AddSingleton<
+            IDomainEventSubscriber<ResourceArchivedEvent>,
+            ResourceLifecycleEventLogSubscriber>();
+        services.AddSingleton<
+            IDomainEventSubscriber<ResourceDeletedEvent>,
+            ResourceLifecycleEventLogSubscriber>();
 
         switch (options.Provider)
         {
@@ -51,7 +70,7 @@ public static class DependencyInjection
                 break;
 
             case StorageProvider.Mongo:
-                AddMongo(services, options);
+                AddMongo(services, options, configuration);
                 break;
 
             default:
@@ -112,10 +131,20 @@ public static class DependencyInjection
     /// Registers the MongoDB persistence stack. The client, database and
     /// collection handles are thread-safe and registered as singletons; the
     /// repository (the unit of work) is scoped, like its EF Core counterpart.
+    /// <para>
+    /// Also registers the transactional-outbox stack: the outbox store (the
+    /// <c>outbox_events</c> collection), the Confluent.Kafka publisher (one
+    /// long-lived producer per process), and the relay (a hosted background
+    /// service that moves committed outbox rows to Kafka). The relay is only
+    /// registered when <c>Kafka:BootstrapServers</c> is configured — without
+    /// a broker the outbox rows simply accumulate, and the API (including
+    /// the in-memory subscribers) keeps working.
+    /// </para>
     /// </summary>
     private static void AddMongo(
         IServiceCollection services,
-        PersistenceOptions options)
+        PersistenceOptions options,
+        IConfiguration? configuration)
     {
         ArgumentException.ThrowIfNullOrEmpty(options.MongoConnectionString);
 
@@ -131,5 +160,35 @@ public static class DependencyInjection
 
         services.AddScoped<IResourceRepository, MongoResourceRepository>();
         services.AddScoped<IInfrastructureInitializer, MongoInfrastructureInitializer>();
+
+        // Transactional outbox: domain events are written to the
+        // outbox_events collection inside the unit-of-work transaction and
+        // relayed to Kafka in the background.
+        services.Configure<KafkaOptions>(section =>
+        {
+            if (configuration is null)
+            {
+                return;
+            }
+
+            configuration.GetSection(KafkaOptions.SectionName).Bind(section);
+        });
+
+        services.Configure<OutboxOptions>(section =>
+            configuration?.GetSection(OutboxOptions.SectionName)?.Bind(section));
+
+        services.AddSingleton<MongoOutboxEventStore>(provider =>
+            new MongoOutboxEventStore(provider.GetRequiredService<IMongoDatabase>()));
+        services.AddSingleton<IOutboxEventStore>(provider =>
+            provider.GetRequiredService<MongoOutboxEventStore>());
+
+        services.AddSingleton<IKafkaEventPublisher, ConfluentKafkaEventPublisher>();
+
+        var bootstrapServers = configuration?[KafkaOptions.SectionName + ":BootstrapServers"];
+
+        if (!string.IsNullOrWhiteSpace(bootstrapServers))
+        {
+            services.AddHostedService<OutboxEventRelayService>();
+        }
     }
 }

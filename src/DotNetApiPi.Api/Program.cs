@@ -26,8 +26,10 @@ var storageOptions = builder.Configuration
 builder.Services.AddApplication();
 
 // Register the infrastructure layer (persistence, repositories, the domain
-// event dispatcher and the provider-specific infrastructure initializer).
-builder.Services.AddInfrastructure(storageOptions);
+// event dispatcher, the provider-specific infrastructure initializer, and —
+// for the MongoDB provider — the transactional outbox + Kafka relay,
+// configured from the "Kafka" and "Outbox" configuration sections).
+builder.Services.AddInfrastructure(storageOptions, builder.Configuration);
 
 // Configure MVC / controllers.
 builder.Services

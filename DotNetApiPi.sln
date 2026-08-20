@@ -23,6 +23,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DotNetApiPi.Infrastructure.
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DotNetApiPi.Api.Integration.Tests", "tests\DotNetApiPi.Api.Integration.Tests\DotNetApiPi.Api.Integration.Tests.csproj", "{5EC315F1-5C6A-44A5-8363-97D940B8EAE7}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DotNetApiPi.Consumer", "src\DotNetApiPi.Consumer\DotNetApiPi.Consumer.csproj", "{0D3DD800-7B02-49C5-8308-88D4627EE91B}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -129,6 +131,18 @@ Global
 		{5EC315F1-5C6A-44A5-8363-97D940B8EAE7}.Release|x64.Build.0 = Release|Any CPU
 		{5EC315F1-5C6A-44A5-8363-97D940B8EAE7}.Release|x86.ActiveCfg = Release|Any CPU
 		{5EC315F1-5C6A-44A5-8363-97D940B8EAE7}.Release|x86.Build.0 = Release|Any CPU
+		{0D3DD800-7B02-49C5-8308-88D4627EE91B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{0D3DD800-7B02-49C5-8308-88D4627EE91B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{0D3DD800-7B02-49C5-8308-88D4627EE91B}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{0D3DD800-7B02-49C5-8308-88D4627EE91B}.Debug|x64.Build.0 = Debug|Any CPU
+		{0D3DD800-7B02-49C5-8308-88D4627EE91B}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{0D3DD800-7B02-49C5-8308-88D4627EE91B}.Debug|x86.Build.0 = Debug|Any CPU
+		{0D3DD800-7B02-49C5-8308-88D4627EE91B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{0D3DD800-7B02-49C5-8308-88D4627EE91B}.Release|Any CPU.Build.0 = Release|Any CPU
+		{0D3DD800-7B02-49C5-8308-88D4627EE91B}.Release|x64.ActiveCfg = Release|Any CPU
+		{0D3DD800-7B02-49C5-8308-88D4627EE91B}.Release|x64.Build.0 = Release|Any CPU
+		{0D3DD800-7B02-49C5-8308-88D4627EE91B}.Release|x86.ActiveCfg = Release|Any CPU
+		{0D3DD800-7B02-49C5-8308-88D4627EE91B}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -142,5 +156,6 @@ Global
 		{2578DBC7-3874-4C25-AC48-C2754D2AF2CD} = {0AB3BF05-4346-4AA6-1389-037BE0695223}
 		{53277FE7-380F-40D9-BEDB-E14C708A5CB1} = {0AB3BF05-4346-4AA6-1389-037BE0695223}
 		{5EC315F1-5C6A-44A5-8363-97D940B8EAE7} = {0AB3BF05-4346-4AA6-1389-037BE0695223}
+		{0D3DD800-7B02-49C5-8308-88D4627EE91B} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
 	EndGlobalSection
 EndGlobal

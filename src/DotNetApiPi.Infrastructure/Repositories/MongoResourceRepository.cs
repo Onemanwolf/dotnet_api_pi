@@ -2,7 +2,9 @@ using DotNetApiPi.Application.Common;
 using DotNetApiPi.Application.Common.Exceptions;
 using DotNetApiPi.Domain.Common;
 using DotNetApiPi.Domain.Entities;
+using DotNetApiPi.Domain.Events;
 using DotNetApiPi.Domain.Repositories;
+using DotNetApiPi.Infrastructure.Outbox;
 using DotNetApiPi.Infrastructure.Persistence.Mongo;
 using MongoDB.Driver;
 using MongoDB.Driver.Linq;
@@ -23,15 +25,25 @@ namespace DotNetApiPi.Infrastructure.Repositories;
 /// by a save performs no writes.
 /// </para>
 /// <para>
-/// <b>Per-aggregate atomicity.</b> <see cref="SaveChangesAsync"/> processes the
-/// staged change set one aggregate at a time, in a stable (identity-sorted)
-/// order: for each aggregate it issues the single write command that covers
-/// that aggregate (insert, version-guarded replace, or delete) and only then
-/// dispatches and clears <i>that aggregate's</i> domain events. The unit of
-/// work therefore degrades in a predictable way: if a write fails or the
-/// process dies mid-save, every earlier aggregate is fully persisted <i>and</i>
-/// fully dispatched, and no later aggregate has been touched — events are
-/// never dispatched for an aggregate whose write did not succeed.
+/// <b>Unit-of-work atomicity (transactional outbox).</b>
+/// <see cref="SaveChangesAsync"/> plans the writes in a stable
+/// (identity-sorted) order and applies them — plus the outbox rows for every
+/// raised domain event — inside a <b>single client-session transaction</b>
+/// (one <c>IClientSessionHandle</c>, whose <c>WithTransactionAsync</c> wraps
+/// the first write through the last) — the outbox
+/// rows commit or abort with the aggregate writes, which is the core
+/// invariant of the transactional-outbox pattern: an event is handed to the
+/// publisher <i>if and only if</i> the state change committed. In-memory
+/// subscribers are then dispatched after the commit (the existing contract),
+/// and the rows are picked up by the outbox relay for Kafka delivery.
+/// </para>
+/// <para>
+/// <b>Replica set requirement.</b> Multi-document transactions are only
+/// available on a replica set (standalone <c>mongod</c> cannot run them).
+/// The compose stack runs a single-node replica set for this reason; against
+/// a standalone server the transaction start fails with a
+/// <c>TransactionalException</c> and the unit of work is aborted (nothing is
+/// partially applied).
 /// </para>
 /// <para>
 /// <b>Optimistic concurrency.</b> Replacements and removals are filtered on
@@ -39,18 +51,9 @@ namespace DotNetApiPi.Infrastructure.Repositories;
 /// (<c>Id == … AND Version == …</c>). If another writer committed a newer
 /// version in the meantime, the filter matches nothing, the affected count is
 /// zero, and <see cref="ResourceConcurrencyException"/> is thrown (HTTP 412)
-/// instead of silently overwriting or deleting the concurrent change.
-/// </para>
-/// <para>
-/// <b>Residual risk (accepted for this scaffold).</b> The writes above are
-/// still independent commands, so a failure <i>between</i> aggregates leaves
-/// the change set partially applied. True multi-document atomicity requires a
-/// MongoDB transaction, which requires a replica set; this scaffold targets a
-/// standalone single server, where transactions are unavailable. If a replica
-/// set becomes available, wrap the per-aggregate commands in a client-session
-/// transaction (one <c>IClientSessionHandle</c>, <c>StartTransactionAsync</c>
-/// before the first write, <c>CommitTransactionAsync</c> after the last) to
-/// make the whole unit of work atomic.
+/// instead of silently overwriting or deleting the concurrent change — and
+/// the whole unit of work (all aggregates plus their outbox rows) is rolled
+/// back with the failed write.
 /// </para>
 /// </summary>
 public sealed class MongoResourceRepository : IResourceRepository
@@ -66,18 +69,35 @@ public sealed class MongoResourceRepository : IResourceRepository
     /// Initializes a new instance of the <see cref="MongoResourceRepository"/>
     /// class.
     /// </summary>
+    /// <param name="client">The MongoDB client (used to start the
+    /// unit-of-work client session/transaction).</param>
     /// <param name="collection">The collection that stores the resource documents.</param>
+    /// <param name="outboxStore">The outbox event store (rows are written
+    /// inside the unit-of-work transaction).</param>
     /// <param name="dispatcher">The domain event dispatcher.</param>
+    /// <param name="timeProvider">
+    /// An optional <see cref="TimeProvider"/> used to stamp outbox rows
+    /// (defaults to the system clock; tests may supply a fixed clock).
+    /// </param>
     public MongoResourceRepository(
+        IMongoClient client,
         IMongoCollection<ResourceDocument> collection,
-        IDomainEventDispatcher dispatcher)
+        IOutboxEventStore outboxStore,
+        IDomainEventDispatcher dispatcher,
+        TimeProvider? timeProvider = null)
     {
+        _client = client ?? throw new ArgumentNullException(nameof(client));
         _collection = collection ?? throw new ArgumentNullException(nameof(collection));
+        _outboxStore = outboxStore ?? throw new ArgumentNullException(nameof(outboxStore));
         _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
+        _time = timeProvider ?? TimeProvider.System;
     }
 
+    private readonly IMongoClient _client;
     private readonly IMongoCollection<ResourceDocument> _collection;
+    private readonly IOutboxEventStore _outboxStore;
     private readonly IDomainEventDispatcher _dispatcher;
+    private readonly TimeProvider _time;
 
     // Unit of work: every aggregate staged (added, loaded and/or mutated) since
     // the last SaveChangesAsync call. Aggregates that were loaded from the
@@ -216,11 +236,9 @@ public sealed class MongoResourceRepository : IResourceRepository
         // the persisted document (a plain read with no mutation therefore
         // triggers no writes), and deletes for removed aggregates.
         //
-        // The plan is processed one aggregate at a time, in identity-sorted
-        // (stable) order: each aggregate's write completes and its domain
-        // events are dispatched and cleared before the next aggregate starts,
-        // so a failure mid-save leaves the change set in a predictable
-        // per-aggregate state (see the class documentation).
+        // The plan is processed in identity-sorted (stable) order so the
+        // transaction touches the documents in a deterministic order (no
+        // write-order surprises under concurrent units of work).
         var plan = new List<(Guid Id, TrackedAggregate? Tracked, (Resource, int?)? Removed)>();
 
         foreach (var (id, tracked) in _staged)
@@ -240,96 +258,183 @@ public sealed class MongoResourceRepository : IResourceRepository
 
         plan.Sort(static (left, right) => left.Id.CompareTo(right.Id));
 
-        foreach (var (id, tracked, removed) in plan)
+        // Transactional outbox: snapshot the raised domain events into outbox
+        // rows BEFORE the write. The rows are inserted inside the same
+        // transaction, so an event is persisted iff the aggregate write
+        // commits. (The in-memory subscribers still see the same events after
+        // the commit, below.)
+        var now = _time.GetUtcNow().UtcDateTime;
+        var outboxRecords = new List<OutboxEventRecord>();
+
+        foreach (var (_, tracked, removed) in plan)
         {
-            if (removed is not null)
-            {
-                var (_, loadedVersion) = _toRemove[id];
-
-                // Compare-and-swap delete (same guard as the replace path,
-                // and matching EF, whose DELETE also carries the concurrency
-                // token in its WHERE): a concurrent writer that committed a
-                // newer version in the meantime makes the filter miss, so
-                // deleting would silently lose that update. A delete of a
-                // never-persisted aggregate (nothing can exist yet) is left
-                // unfiltered.
-                var filter = loadedVersion is int version
-                    ? Builders<ResourceDocument>.Filter.And(
-                        Builders<ResourceDocument>.Filter.Eq(d => d.Id, id),
-                        Builders<ResourceDocument>.Filter.Eq(d => d.Version, version))
-                    : Builders<ResourceDocument>.Filter.Eq(d => d.Id, id);
-
-                var result = await _collection
-                    .DeleteOneAsync(filter, cancellationToken)
-                    .ConfigureAwait(false);
-
-                if (loadedVersion is not null && result.DeletedCount == 0)
-                {
-                    throw new ResourceConcurrencyException(id);
-                }
-
-                affected += (int)result.DeletedCount;
-            }
-            else if (tracked!.Original is null)
-            {
-                // A brand-new aggregate. (Staging an AddAsync for an id that
-                // was previously loaded in the same unit of work would race
-                // the persisted document and surface as a duplicate-key
-                // error — a programming error, like EF's Add-on-detached
-                // conflicts; new ids are Guid.NewGuid, so this is
-                // unreachable through the API.)
-                await _collection
-                    .InsertOneAsync(
-                        ResourceDocumentMapper.ToDocument(tracked.Aggregate),
-                        options: null,
-                        cancellationToken)
-                    .ConfigureAwait(false);
-                affected++;
-            }
-            else
-            {
-                var document = ResourceDocumentMapper.ToDocument(tracked.Aggregate);
-
-                if (DocumentsEqual(tracked.Original, document))
-                {
-                    // Unchanged read: no write, nothing to dispatch.
-                    continue;
-                }
-
-                // Compare-and-swap on the version the aggregate was loaded
-                // with: a concurrent write that committed a newer version in
-                // the meantime makes the filter miss and ModifiedCount stays
-                // zero.
-                var filter = Builders<ResourceDocument>.Filter.And(
-                    Builders<ResourceDocument>.Filter.Eq(d => d.Id, id),
-                    Builders<ResourceDocument>.Filter.Eq(
-                        d => d.Version,
-                        tracked.Original.Version));
-
-                var result = await _collection
-                    .ReplaceOneAsync(
-                        filter,
-                        document,
-                        new ReplaceOptions(),
-                        cancellationToken)
-                    .ConfigureAwait(false);
-
-                if (result.ModifiedCount == 0)
-                {
-                    throw new ResourceConcurrencyException(id);
-                }
-
-                affected++;
-            }
-
-            // Per-aggregate unit of work: dispatch and clear only the events
-            // raised by this aggregate now that its own write has succeeded
-            // (a later aggregate's failure cannot leave this aggregate's
-            // events behind, and a write failure above skips dispatching
-            // entirely for the failed aggregate).
-            var aggregate = removed.HasValue
+            var aggregate = removed is not null
                 ? removed.Value.Item1
                 : tracked!.Aggregate;
+
+            if (aggregate.DomainEvents.Count == 0)
+            {
+                continue;
+            }
+
+            foreach (var domainEvent in aggregate.DomainEvents)
+            {
+                outboxRecords.Add(new OutboxEventRecord(
+                    Guid.NewGuid(),
+                    domainEvent.GetType().Name,
+                    aggregate.Id,
+                    domainEvent.OccurredOn,
+                    OutboxEventEnvelope.SerializeEvent(domainEvent),
+                    OutboxEventStatus.Pending,
+                    Attempts: 0,
+                    CreatedAtUtc: now,
+                    NextRetryAtUtc: null,
+                    LeaseUntilUtc: null,
+                    PublishedAtUtc: null,
+                    TopicPartition: null,
+                    Offset: null,
+                    LastError: null));
+            }
+        }
+
+        // One client-session transaction for the whole unit of work: every
+        // aggregate write AND the outbox inserts commit or abort together.
+        // (Requires a replica set — see the class documentation.)
+        //
+        // WithTransactionAsync manages the lifecycle: it starts the
+        // transaction, runs the body, commits on success, aborts on any
+        // exception, and transparently retries the whole body on transient
+        // transaction errors (e.g. the primary stepping down mid-commit).
+        // The body only reads its captures (plan / outboxRecords), so a
+        // retry re-runs the same writes in a fresh transaction.
+        var session = _client.StartSession();
+
+        try
+        {
+            affected = await session
+                .WithTransactionAsync(
+                    async (tx, txCancellationToken) =>
+                    {
+                        var count = 0;
+
+                        foreach (var (id, tracked, removed) in plan)
+                        {
+                            if (removed is not null)
+                            {
+                                var (_, loadedVersion) = _toRemove[id];
+
+                                // Compare-and-swap delete (same guard as the
+                                // replace path, and matching EF, whose DELETE
+                                // also carries the concurrency token in its
+                                // WHERE): a concurrent writer that committed
+                                // a newer version in the meantime makes the
+                                // filter miss, so deleting would silently
+                                // lose that update. A delete of a
+                                // never-persisted aggregate (nothing can
+                                // exist yet) is left unfiltered.
+                                var filter = loadedVersion is int version
+                                    ? Builders<ResourceDocument>.Filter.And(
+                                        Builders<ResourceDocument>.Filter.Eq(d => d.Id, id),
+                                        Builders<ResourceDocument>.Filter.Eq(d => d.Version, version))
+                                    : Builders<ResourceDocument>.Filter.Eq(d => d.Id, id);
+
+                                var result = await _collection
+                                    .DeleteOneAsync(tx, filter, options: null, txCancellationToken)
+                                    .ConfigureAwait(false);
+
+                                if (loadedVersion is not null && result.DeletedCount == 0)
+                                {
+                                    throw new ResourceConcurrencyException(id);
+                                }
+
+                                count += (int)result.DeletedCount;
+                            }
+                            else if (tracked!.Original is null)
+                            {
+                                // A brand-new aggregate. (Staging an AddAsync
+                                // for an id that was previously loaded in the
+                                // same unit of work would race the persisted
+                                // document and surface as a duplicate-key
+                                // error — a programming error, like EF's
+                                // Add-on-detached conflicts; new ids are
+                                // Guid.NewGuid, so this is unreachable
+                                // through the API.)
+                                await _collection
+                                    .InsertOneAsync(
+                                        tx,
+                                        ResourceDocumentMapper.ToDocument(tracked.Aggregate),
+                                        options: null,
+                                        txCancellationToken)
+                                    .ConfigureAwait(false);
+                                count++;
+                            }
+                            else
+                            {
+                                var document = ResourceDocumentMapper.ToDocument(tracked.Aggregate);
+
+                                if (DocumentsEqual(tracked.Original, document))
+                                {
+                                    // Unchanged read: no write, nothing to
+                                    // dispatch.
+                                    continue;
+                                }
+
+                                // Compare-and-swap on the version the
+                                // aggregate was loaded with: a concurrent
+                                // write that committed a newer version in the
+                                // meantime makes the filter miss and
+                                // ModifiedCount stays zero.
+                                var filter = Builders<ResourceDocument>.Filter.And(
+                                    Builders<ResourceDocument>.Filter.Eq(d => d.Id, id),
+                                    Builders<ResourceDocument>.Filter.Eq(
+                                        d => d.Version,
+                                        tracked.Original.Version));
+
+                                var result = await _collection
+                                    .ReplaceOneAsync(
+                                        tx,
+                                        filter,
+                                        document,
+                                        new ReplaceOptions(),
+                                        txCancellationToken)
+                                    .ConfigureAwait(false);
+
+                                if (result.ModifiedCount == 0)
+                                {
+                                    throw new ResourceConcurrencyException(id);
+                                }
+
+                                count++;
+                            }
+                        }
+
+                        if (outboxRecords.Count > 0)
+                        {
+                            await _outboxStore
+                                .AppendWithinTransactionAsync(outboxRecords, tx, txCancellationToken)
+                                .ConfigureAwait(false);
+                        }
+
+                        return count;
+                    },
+                    new TransactionOptions(),
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            session.Dispose();
+        }
+
+        // Commit succeeded: dispatch and clear the in-memory subscribers for
+        // every staged aggregate (the pre-existing contract — subscribers
+        // only ever see events whose persistence succeeded).
+        foreach (var (_, tracked, removed) in plan)
+        {
+            var aggregate = removed is not null
+                ? removed.Value.Item1
+                : tracked!.Aggregate;
+
             if (aggregate.DomainEvents.Count > 0)
             {
                 await _dispatcher

@@ -38,6 +38,11 @@ public sealed class DeleteResourceCommandHandler : ICommandHandler<DeleteResourc
         // to HTTP 412 via the exception-mapping middleware.
         ConcurrencyPreconditions.EnsureMatches(resource, command.ExpectedVersion);
 
+        // Stage the deletion domain event on the aggregate so that it is
+        // persisted (Mongo: outbox row inside the same unit of work) before
+        // the document is removed.
+        resource.Delete();
+
         await _repository.RemoveAsync(resource, cancellationToken).ConfigureAwait(false);
         await _repository.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
 

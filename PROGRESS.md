@@ -239,12 +239,88 @@ the approach documented in the official 3.x driver docs (see below).
 
 ### Possible next steps
 
-- Outbox pattern for at-least-once domain-event delivery (subscriber failures
-  are currently logged, not retried).
-- Mongo multi-document transactions (requires a replica set) to make the
-  cross-aggregate unit of work atomic.
+- ~~Outbox pattern for at-least-once domain-event delivery~~ — done, see the
+  **Kafka + transactional outbox** section below.
+- ~~Mongo multi-document transactions (requires a replica set)~~ — done: the
+  compose stack runs a single-node replica set and the Mongo provider writes
+  aggregate + outbox rows in one transaction.
 - Real authentication (OIDC) before exposing the API publicly.
 - Testcontainers-based tests for the Mongo provider path.
+
+## Kafka + transactional outbox (2026-08-20)
+
+Deep research (Confluent.Kafka 2.15 / MongoDB.Driver 3.11 / `apache/kafka:4.3.1`
+KRaft) recorded in `KAFKA_OUTBOX_PLAN.md`; implemented and verified end to
+end on the compose stack.
+
+### What was added
+
+- **Domain events for the full resource lifecycle**: `ResourceCreatedEvent`
+  (existing), `ResourceActivatedEvent`, `ResourceArchivedEvent`,
+  `ResourceDeletedEvent`. `Delete` stamps `DeletedAtUtc` **without** a
+  version bump (deletion is terminal; nothing can race against it).
+- **Transactional outbox (MongoDB)**: `OutboxEventRecord`/
+  `OutboxEventDocument` (collection `outbox_events`, same DB as the
+  aggregate; indexes on `status+createdAtUtc` and `resourceId`).
+  `MongoResourceRepository` now starts a client session and commits the
+  aggregate write **and** the outbox insert in one
+  `session.WithTransactionAsync` — the atomicity guarantee the outbox needs.
+- **Outbox relay** (`OutboxEventRelayService`, `IHostedService`): polls the
+  store, claims rows with an atomic `FindOneAndUpdate` (lease-based, oldest
+  `createdAtUtc` first — a tie-break on `id` preserves creation order),
+  publishes through the publisher, marks rows `Published` with the resulting
+  partition/offset; failures get exponential backoff and rows that exhaust
+  `Outbox:MaxAttempts` are marked `Dead` (terminal, inspectable, no silent
+  drops). Started only for `Storage:Provider=mongo` **and** non-empty
+  `Kafka:BootstrapServers` (local SQLite dev stays zero-dependency).
+- **Kafka publisher** (`ConfluentKafkaEventPublisher`): `acks=all`,
+  idempotence enabled, snappy, `message.timeout.ms=30000`, delivery report
+  surfaced into the outbox row; message key = lower-case invariant `D`
+  resource id (per-resource partition ordering), `x-event-id` header = the
+  stable event id (consumer idempotency). Delivery is **at-least-once**.
+- **Envelope**: camelCase JSON `eventId` / `eventType` / `resourceId` /
+  `occurredOnUtc` / `payload`.
+- **Consumer app** (`src/DotNetApiPi.Consumer`): standalone console app
+  (group `dotnet-api-pi-logger`, `auto.offset.reset=earliest`, manual
+  commit) that logs every message — topic, partition, offset, key, headers,
+  timestamp, body — as a single structured JSON line; runs as its own
+  compose service with its own Dockerfile.
+- **Docker Compose**: `apache/kafka:4.3.1` single KRaft broker+controller
+  (three listeners; `localhost:29092` exposed for host tooling), one-shot
+  `kafka-init` (creates `resource-events`, 3 partitions, RF 1, 1 h
+  retention; `auto.create.topics.enable=false`) and `kafka-data-init` (the
+  image runs as `appuser` but a fresh volume is root-owned); `mongo` is now a
+  **single-node replica set without authentication** (a no-restart compose
+  stack cannot bootstrap keyFile + RS users) with one-shot `mongo-init`.
+  No `.env` variables are required anymore.
+- **Tests**: domain tests for the three new events (including
+  "delete does not bump the version"); relay unit tests against an in-memory
+  store fake (publish + partition/offset marking, retry/backoff/dead-letter,
+  lease re-claim).
+
+### Verified end to end (compose)
+
+Create → activate → archive → delete on one resource produced four outbox
+rows, all `Published` with `topicPartition`/`offset`, and four consumer log
+lines with the same key, same partition and consecutive offsets
+(0→3) — i.e. per-resource ordering held. Each line carried the
+`x-event-id` header and the full envelope body.
+
+### Gotchas hit (compose-specific)
+
+- This compose version **mangles a plain-scalar `command`** (shell-form-
+  splits it — only the first token reaches the container). Scripts must be
+  list elements: `command: ["/bin/sh", "-c", "one line of script"]`.
+- `apache/kafka` 4.x scripts are `.sh`-suffixed
+  (`/opt/kafka/bin/kafka-topics.sh`); default user is `appuser` (uid 1000).
+- An authenticated replica set **requires** a keyFile
+  (`BadValue: security.keyFile is required...`); hence the no-auth dev
+  posture (loopback ports only).
+- MongoDB driver 3.x: sessions are the **first** argument of collection
+  calls, `IClientSessionHandle` is `IDisposable`, no `Builders.Filter.IsNull`,
+  `CreateOneIndex` overloads are obsolete, and Guid fields need
+  `[BsonGuidRepresentation]` (driver default representation is
+  `Unspecified` — writes fail at runtime, not compile time).
 
 ## Run
 
@@ -256,11 +332,13 @@ dotnet run --project src/DotNetApiPi.Api
 # Swagger UI: http://localhost:5181/swagger (Development)
 ```
 
-Docker (API + MongoDB):
+Docker (API + MongoDB + Kafka + consumer):
 
 ```bash
 docker compose up -d --build
 # API: http://localhost:8090  (Swagger at /swagger)
-# Mongo shell: mongosh --port 27018 -u <user> -p <password> --authenticationDatabase admin
-docker compose down   # add -v to delete the mongo data volume
+# Outbox rows:  docker compose exec mongo mongosh --quiet dotnet_api_pi --eval 'db.outbox_events.find().forEach(d=>print(d.eventType, d.status))'
+# Event stream: docker compose logs -f consumer
+# Kafka from the host: kcat -b localhost:29092 -C -t resource-events
+docker compose down   # add -v to delete the mongo + kafka data volumes
 ```

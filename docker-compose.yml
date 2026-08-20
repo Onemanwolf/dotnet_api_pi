@@ -1,17 +1,22 @@
-# Runs the API against a MongoDB server. The API container is built from
-# src/DotNetApiPi.Api/Dockerfile and is configured (via the Storage__*
-# environment variables) to use the Mongo storage provider instead of the
-# default embedded SQLite database.
+# Runs the API against a MongoDB server and a Kafka broker. The API container
+# is built from src/DotNetApiPi.Api/Dockerfile and is configured (via the
+# Storage__* / Kafka__* environment variables) to use the Mongo storage
+# provider, with domain events flowing through the transactional outbox
+# (outbox_events collection) to the Kafka topic "resource-events". A
+# separate consumer container (src/DotNetApiPi.Consumer/Dockerfile) reads the
+# topic and logs every message's content and metadata to docker logs.
 #
-# CREDENTIALS: the MongoDB root credentials are parameterized through the
-# MONGO_USER / MONGO_PASSWORD variables (see .env.example; copy it to .env
-# and adjust — .env is gitignored). The values below are the built-in
-# defaults used when .env is absent.
+# CREDENTIALS: this scaffold runs MongoDB WITHOUT authentication (see the
+# SECURITY NOTE below): an authenticated replica set requires a shared
+# security.keyFile on every member, which a no-restart single-node local
+# dev stack cannot bootstrap. Kafka runs PLAINTEXT (no SASL). The ports are
+# exposed on loopback only.
 #
-# SECURITY NOTE: authentication is enabled, but the default credentials are
-# well known and the ports are exposed on the host. This is intentional for
-# a local development scaffold only — never run this configuration on a
-# network other than loopback/localhost without changing MONGO_PASSWORD.
+# SECURITY NOTE: this is a local development scaffold — MongoDB and Kafka
+# are unauthenticated and reachable on localhost ports 27018/29092. Never
+# run this configuration on a network other than loopback/localhost.
+# Production deployments must add auth: for MongoDB a replica set with a
+# keyFile + created users, for Kafka SASL/SCRAM (+ mTLS at the edges).
 services:
   api:
     build:
@@ -29,12 +34,29 @@ services:
       ASPNETCORE_ENVIRONMENT: Development
       Storage__Provider: mongo
       # The root user is created in the admin database by
-      # MONGO_INITDB_ROOT_*, hence authSource=admin.
-      Storage__MongoConnectionString: "mongodb://${MONGO_USER:-dotnetapipi}:${MONGO_PASSWORD:-secret-dev}@mongo:27017?authSource=admin"
+      # MONGO_INITDB_ROOT_*, hence authSource=admin. The replicaSet parameter
+      # tells the driver to treat the server as a replica set (multi-document
+      # transactions — required by the outbox write path — only work on a
+      # replica set).
+      Storage__MongoConnectionString: "mongodb://mongo:27017/?replicaSet=rs0"
       Storage__MongoDatabaseName: dotnet_api_pi
+      # Outbox relay: publish committed outbox rows to the topic. From inside
+      # the compose network the broker is reached via its internal listener.
+      Kafka__BootstrapServers: kafka:19092
+      Kafka__Topic: resource-events
     depends_on:
       mongo:
         condition: service_healthy
+      # The replica set needs to be initiated (and have a primary) before the
+      # API can write: transactions require a primary.
+      mongo-init:
+        condition: service_completed_successfully
+      kafka:
+        condition: service_healthy
+      # The topic must exist before the first publish attempt (auto topic
+      # creation is disabled on the broker).
+      kafka-init:
+        condition: service_completed_successfully
     # The API exposes an /health endpoint; probing it also verifies that the
     # composition root's startup (persistence initialization) completed.
     healthcheck:
@@ -48,11 +70,10 @@ services:
   mongo:
     image: mongo:8
     container_name: dotnet-api-pi-mongo
-    # Root credentials (audit finding F-20): MONGO_INITDB_ROOT_* creates the
-    # admin-DB root user on first initialization. Override via .env.
-    environment:
-      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:-dotnetapipi}
-      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-secret-dev}
+    # Single-node replica set: multi-document transactions (the outbox write
+    # path) and change streams are only available on a replica set, not on a
+    # standalone mongod. mongo-init performs the one-time rs.initiate.
+    command: ["--replSet", "rs0", "--bind_ip_all"]
     # The host port is mapped to 27018 so the scaffold keeps working even
     # when a local MongoDB already occupies 27017. Inside the compose
     # network the API always reaches Mongo at mongo:27017.
@@ -60,15 +81,143 @@ services:
       - "27018:27017"
     volumes:
       - mongo-data:/data/db
-    # The healthcheck authenticates with the same credentials (the previous
-    # unauthenticated ping is no longer valid).
+    # ping succeeds before the replica set is initiated, so the API
+    # additionally waits on mongo-init (which waits for a writable primary).
     healthcheck:
-      test: ["CMD-SHELL", "mongosh --quiet -u '${MONGO_USER:-dotnetapipi}' -p '${MONGO_PASSWORD:-secret-dev}' --authenticationDatabase admin --eval \"db.adminCommand('ping')\""]
+      test: ["CMD-SHELL", "mongosh --quiet --eval \"db.adminCommand('ping')\" >/dev/null"]
       interval: 5s
       timeout: 5s
       retries: 20
       start_period: 10s
     restart: unless-stopped
 
+  # One-shot: idempotently initiate the single-node replica set (rs0) and
+  # wait until the node is a writable primary, then exit 0. Re-runs are no-ops
+  # (rs.initiate is only executed when no replica set config exists yet).
+  mongo-init:
+    image: mongo:8
+    container_name: dotnet-api-pi-mongo-init
+    depends_on:
+      mongo:
+        condition: service_healthy
+    # The script travels as a list element after "/bin/sh" "-c": this
+    # compose version mangles a plain scalar command (it shell-form-splits
+    # it, so only the first token reaches the container).
+    # The script is a single-line, single-quoted-safe list element after
+    # "/bin/sh" "-c": this compose version mangles a plain scalar
+    # command (it shell-form-splits it, so only the first token would
+    # reach the container).
+    # The script is a single-line list element after "/bin/sh" "-c":
+    # this compose version mangles a plain scalar command (it
+    # shell-form-splits it, so only the first token would reach the
+    # container).
+    command:
+      - "/bin/sh"
+      - "-c"
+      - 'ok=0; for i in $$(seq 1 60); do if mongosh --host mongo:27017 --quiet --eval ''try { rs.status().ok; } catch (e) { rs.initiate({ _id: "rs0", members: [{ _id: 0, host: "mongo:27017" }] }); }'' >/dev/null 2>&1; then ok=1; break; fi; sleep 2; done; if [ "$$ok" != "1" ]; then echo "ERROR: could not initiate replica set rs0 on mongo:27017" >&2; exit 1; fi; primary=0; for i in $$(seq 1 60); do if mongosh --host mongo:27017 --quiet --eval ''db.hello().isWritablePrimary'' | grep -q true; then primary=1; break; fi; sleep 2; done; if [ "$$primary" != "1" ]; then echo "ERROR: replica set rs0 has no writable primary yet" >&2; exit 1; fi; echo ''single-node replica set rs0 has a writable primary'''
+  # One-shot: fix ownership of the Kafka data volume. The image runs as
+  # appuser (uid 1000), but a freshly seeded named volume is root-owned,
+  # which makes the KRaft bootstrap formatting fail with AccessDenied.
+  kafka-data-init:
+    image: apache/kafka:4.3.1
+    container_name: dotnet-api-pi-kafka-data-init
+    user: "0:0"
+    command:
+      - "/bin/sh"
+      - "-c"
+      - "chown -R 1000:1000 /var/kafka-logs && echo 'kafka data volume is owned by appuser'"
+    volumes:
+      - kafka-data:/var/kafka-logs
+
+  # Apache Kafka 4.x (KRaft-only — ZooKeeper was removed in 4.0.0), single
+  # combined controller+broker node from the official image.
+  kafka:
+    image: apache/kafka:4.3.1
+    container_name: dotnet-api-pi-kafka
+    depends_on:
+      kafka-data-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # Three listeners:
+      #   CONTROLLER - Raft quorum traffic, internal only (never advertised).
+      #   BROKER     - compose-network clients (api, consumer, kafka-init),
+      #                advertised as kafka:19092.
+      #   EXTERNAL   - host clients (kcat, IDEs), advertised as
+      #                localhost:29092 and mapped to the host's 29092.
+      KAFKA_LISTENERS: CONTROLLER://:29093,BROKER://:19092,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: BROKER://kafka:19092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,BROKER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: BROKER
+      # Single-node cluster: the internal topics the broker auto-manages must
+      # use replication factor 1 (the broker default of 3 cannot be met on a
+      # single node and would stall topic creation).
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+      # Explicit topic lifecycle: the application creates topics on purpose;
+      # kafka-init pre-creates resource-events. (Auto-creation is disabled
+      # even in dev so the stack exercises the same lifecycle as production.)
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/kafka-logs
+      # Pinned cluster id (the official single-node example does the same) so
+      # the KRaft metadata is deterministic across volume recreations.
+      CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+    ports:
+      # Host-facing listener: kcat / IDE tooling on the host.
+      - "29092:29092"
+    volumes:
+      - kafka-data:/var/kafka-logs
+    # Forces a full metadata round-trip against the internal listener: proves
+    # the broker serves clients, not merely that the JVM is up.
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:19092 --list || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
+
+  # One-shot: pre-create the topic (idempotent via --if-not-exists).
+  # Partitions: 3 (demonstrates consumer parallelism); replication factor: 1
+  # (single node); retention: 1 h (keeps the Docker VM disk small in dev).
+  kafka-init:
+    image: apache/kafka:4.3.1
+    container_name: dotnet-api-pi-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command:
+      ["/opt/kafka/bin/kafka-topics.sh",
+       "--bootstrap-server", "kafka:19092",
+       "--create", "--if-not-exists",
+       "--topic", "resource-events",
+       "--partitions", "3",
+       "--replication-factor", "1",
+       "--config", "retention.ms=3600000"]
+
+  # The event consumer: reads resource-events in the "dotnet-api-pi-logger"
+  # group and logs every message's content and metadata (topic, partition,
+  # offset, key, headers, timestamp, body) to stdout — i.e. docker logs.
+  consumer:
+    build:
+      context: .
+      dockerfile: src/DotNetApiPi.Consumer/Dockerfile
+    container_name: dotnet-api-pi-consumer
+    environment:
+      Kafka__BootstrapServers: kafka:19092
+      Kafka__Topic: resource-events
+      Consumer__GroupId: dotnet-api-pi-logger
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   mongo-data:
+  kafka-data:

@@ -30,9 +30,13 @@ without being tied to a specific business domain.
   request logging, and opt-in OpenTelemetry.
 - **Real EF Core migrations** — the SQLite schema is managed by
   `dotnet-ef` migrations applied at startup, not `EnsureCreated`.
+- **Transactional outbox** — domain events are written to the same MongoDB
+  transaction as the aggregate write, then relayed to Kafka (at-least-once;
+  consumers dedupe on the stable `x-event-id` header).
 - **Docker** — multi-stage `Dockerfile` on .NET 10 images (runs as the
   unprivileged `app` user, `curl`-based healthcheck) + `docker-compose.yml`
-  (API + MongoDB with root credentials).
+  (API + single-node MongoDB replica set + Apache Kafka 4 + a logging
+  consumer for `resource-events`).
 - **Central Package Management** — all package versions live in
   `Directory.Packages.props`; a CI gate restores, builds with
   `-warnaserror`, and tests on push/PR (`.github/workflows/ci.yml`).
@@ -304,6 +308,13 @@ The persistence backend is selected from the `Storage` configuration section
 | `Storage:SqliteConnectionString` | `Data Source=dotnet_api_pi.db` | Used by the SQLite provider |
 | `Storage:MongoConnectionString` | `mongodb://localhost:27017` | Used by the Mongo provider — include credentials when the server requires them, e.g. `mongodb://user:pass@host:27017?authSource=admin` |
 | `Storage:MongoDatabaseName` | `dotnet_api_pi` | Mongo database name |
+| `Kafka:BootstrapServers` | *(empty)* | Comma-separated broker list (e.g. `kafka:19092` in compose). When empty, the outbox relay is not started — events stay `Pending` in the outbox collection |
+| `Kafka:Topic` | `resource-events` | Topic the outbox relay publishes to |
+| `Outbox:PollIntervalMs` | `1000` | Relay poll interval |
+| `Outbox:BatchSize` | `50` | Max events claimed per poll |
+| `Outbox:MaxAttempts` | `5` | Publish attempts before an event is marked `Dead` |
+| `Outbox:LeaseSeconds` | `30` | Claim lease; expired leases are reclaimable (crash recovery) |
+| `Outbox:BaseRetryDelayMs` | `5000` | Base of the exponential retry backoff |
 
 Both providers implement the same `IResourceRepository` contract, so the API
 behaviour is identical; only the storage engine changes. (The API's local
@@ -312,7 +323,7 @@ external services.) The SQLite provider applies EF Core migrations at startup
 (see `src/DotNetApiPi.Infrastructure/Migrations`); the Mongo provider creates
 its collection lazily on first write.
 
-## Docker (API + MongoDB)
+## Docker (API + MongoDB + Kafka)
 
 ```bash
 docker compose up -d --build
@@ -320,30 +331,49 @@ docker compose up -d --build
 
 | Service | Image | Host port |
 |---------|-------|-----------|
-| `api`   | built from `src/DotNetApiPi.Api/Dockerfile` (multi-stage on .NET 10 images: `sdk:10.0` → `aspnet:10.0`, non-root `app` user) | 8090 → 8080 |
-| `mongo` | `mongo:8` (data persisted in the `mongo-data` volume) | 27018 → 27017 |
+| `api` | built from `src/DotNetApiPi.Api/Dockerfile` (multi-stage on .NET 10 images: `sdk:10.0` → `aspnet:10.0`, non-root `app` user) | 8090 → 8080 |
+| `consumer` | built from `src/DotNetApiPi.Consumer/Dockerfile` — consumes `resource-events` and logs every message (content + metadata) to Docker logs | — |
+| `mongo` | `mongo:8`, single-node replica set `rs0` (multi-document transactions require a replica set); no auth, loopback-only ports | 27018 → 27017 |
+| `kafka` | `apache/kafka:4.3.1` (KRaft-only, single broker+controller node; topic `resource-events` pre-created by `kafka-init`) | 29092 → 29092 (external listener for host tooling) |
 
-The API container is configured for the **Mongo** storage provider via
-`Storage__Provider=mongo` and a credentialed connection string
-(`Storage__MongoConnectionString=mongodb://${MONGO_USER}:${MONGO_PASSWORD}@mongo:27017?authSource=admin`).
-MongoDB runs with **root authentication enabled** — the credentials are
-parameterized through `MONGO_USER` / `MONGO_PASSWORD` (defaults
-`dotnetapipi` / `secret-dev`; copy `.env.example` to `.env` and adjust;
-`.env` is gitignored). Both containers carry healthchecks (`/health` probe via
-`curl` for the API; authenticated `mongosh ping` for Mongo) and
-`docker compose ps` only reports the API as *healthy* once startup, including
-persistence initialization, has completed.
+One-shot helpers: `mongo-init` (initiates the replica set, idempotent) and
+`kafka-data-init` (fixes volume ownership before the KRaft bootstrap). All
+services carry healthchecks and ordered `depends_on`, so the stack converges
+without manual steps; `docker compose ps` reports the API *healthy* only once
+startup — including Mongo index creation and the outbox relay startup — has
+completed.
 
-> **Security note:** the compose stack enables authentication, but the default
-> credentials are well known and the ports are exposed on the host. This is
-> intentional for a local development scaffold only — never run it on a
-> network other than loopback without changing `MONGO_PASSWORD`.
+The API container is configured for the **Mongo** storage provider
+(`Storage__Provider=mongo`, connection string
+`mongodb://mongo:27017/?replicaSet=rs0`) and publishes to Kafka
+(`Kafka__BootstrapServers=kafka:19092`, topic `resource-events`).
+
+> **Security note:** the dev stack runs MongoDB **without authentication** and
+> Kafka without SASL, and its ports are exposed on the host. This is an
+> intentional local-development scaffold (loopback only) — a single-node
+> replica set with auth needs a keyFile bootstrap that a no-restart compose
+> stack cannot express. For anything beyond localhost, front the services
+> with real auth (MongoDB keyFile replica-set users, Kafka SASL) or run the
+> API against your own broker.
+
+Event flow: an API write commits the aggregate **and** its domain events to
+the `outbox_events` collection in one MongoDB transaction; the outbox relay
+claims rows (oldest first, lease-based), publishes to Kafka keyed by resource
+id (per-resource ordering), and marks rows `Published` with the resulting
+partition/offset. The `consumer` service is a reference consumer (group
+`dotnet-api-pi-logger`) that prints every message — topic, partition, offset,
+key, headers (`x-event-id`), timestamp and body — as one JSON line:
+
+```bash
+docker compose logs -f consumer
+```
 
 Swagger (Development only): `http://localhost:8090/swagger`; the Mongo shell:
-`mongosh --port 27018 -u <user> -p <password> --authenticationDatabase admin`.
-Host ports are mapped to 8090/27018 because 8080 and 27017 are commonly taken
-locally — adjust the `ports:` entries in `docker-compose.yml` if needed. Stop
-with `docker compose down` (add `-v` to also delete the Mongo data).
+`mongosh --port 27018`; Kafka tooling on the host: `kcat -b localhost:29092 -C -t resource-events`.
+Host ports are mapped to 8090/27018/29092 because 8080, 27017 and 9092 are
+commonly taken locally — adjust the `ports:` entries in `docker-compose.yml`
+if needed. Stop with `docker compose down` (add `-v` to also delete the
+Mongo/Kafka data).
 
 ## Versioning & CI
 
