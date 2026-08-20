@@ -28,7 +28,7 @@ public static class DependencyInjection
         services.AddScoped<ICommandHandler<DeleteResourceCommand, Unit>, DeleteResourceCommandHandler>();
 
         services.AddScoped<IQueryHandler<GetResourceByIdQuery, ResourceDto>, GetResourceByIdQueryHandler>();
-        services.AddScoped<IQueryHandler<GetAllResourcesQuery, IReadOnlyList<ResourceDto>>, GetAllResourcesQueryHandler>();
+        services.AddScoped<IQueryHandler<GetAllResourcesQuery, PagedResult<ResourceDto>>, GetAllResourcesQueryHandler>();
 
         return services;
     }

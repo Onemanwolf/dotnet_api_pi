@@ -143,13 +143,21 @@ public sealed class HealthAndErrorHandlingTests : IAsyncLifetime
 
         var id = await CreateResourceAsync(_client);
 
-        // First activation succeeds; a second is a state conflict (409).
-        using var first = await _client.PostAsync($"/api/resources/{id}/activate", null);
-        Assert.Equal(HttpStatusCode.OK, first.StatusCode);
+        // First activation succeeds under the fresh ETag; a second is a
+        // state conflict (409).
+        var first = new HttpRequestMessage(
+            HttpMethod.Post,
+            $"/api/resources/{id}/activate");
+        first.Headers.TryAddWithoutValidation("If-Match", "\"0\"");
+        using (var firstResponse = await _client.SendAsync(first))
+        {
+            Assert.Equal(HttpStatusCode.OK, firstResponse.StatusCode);
+        }
 
         var request = new HttpRequestMessage(
             HttpMethod.Post,
             $"/api/resources/{id}/activate");
+        request.Headers.TryAddWithoutValidation("If-Match", "\"1\"");
         request.Headers.TryAddWithoutValidation(
             CorrelationIdMiddleware.HeaderName,
             correlationId);

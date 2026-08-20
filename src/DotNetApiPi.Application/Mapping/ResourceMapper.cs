@@ -1,12 +1,14 @@
+using DotNetApiPi.Application.Common;
 using DotNetApiPi.Application.Dtos;
 using DotNetApiPi.Domain.Entities;
 
 namespace DotNetApiPi.Application.Mapping;
 
 /// <summary>
-/// Maps domain aggregates to application view models (DTOs).
-/// Mapping keeps the application layer independent of the way data is
-/// persisted and prevents leaking domain internals to the presentation layer.
+/// Maps a <see cref="Resource"/> aggregate to its application DTO (read
+/// model). Mapping keeps the application layer independent of the way data
+/// is persisted and prevents leaking domain internals to the presentation
+/// layer.
 /// </summary>
 public static class ResourceMapper
 {
@@ -27,7 +29,8 @@ public static class ResourceMapper
             // Map the domain enum to its string name at the DTO boundary so
             // the wire contract does not leak the domain type.
             resource.Status.ToString(),
-            resource.Tags.Select(static tag => tag.Value).ToList());
+            resource.Tags.Select(static tag => tag.Value).ToList(),
+            resource.Version);
     }
 
     /// <summary>

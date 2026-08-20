@@ -53,9 +53,10 @@ public sealed class InMemoryDatabase : IAsyncDisposable
         _connection.Open();
         Context = CreateContext();
 
-        // The schema is created up front; EnsureCreated is what the
-        // SqliteInfrastructureInitializer does in production.
-        Context.Database.EnsureCreated();
+        // The schema is created up front; Migrate is what the
+        // SqliteInfrastructureInitializer does in production (the migrations
+        // live in this same assembly, so no MigrationsAssembly hint is needed).
+        Context.Database.Migrate();
     }
 
     /// <summary>

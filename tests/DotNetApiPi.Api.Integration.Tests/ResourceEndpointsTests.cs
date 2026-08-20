@@ -142,15 +142,24 @@ public sealed class ResourceEndpointsTests : IAsyncLifetime
         var created = await CreateResourceAsync("Before Update");
         var id = created.GetProperty("id").GetGuid();
 
-        var response = await _client.PutAsJsonAsync(
-            $"/api/resources/{id}",
-            new { name = "After Update", description = "Updated", tags = (string[]?)null });
+        // Mutating endpoints require If-Match carrying the current ETag
+        // (a fresh resource is at version 0).
+        var request = new HttpRequestMessage(HttpMethod.Put, $"/api/resources/{id}")
+        {
+            Content = JsonContent.Create(
+                new { name = "After Update", description = "Updated", tags = (string[]?)null })
+        };
+        request.Headers.TryAddWithoutValidation("If-Match", "\"0\"");
+
+        var response = await _client.SendAsync(request);
 
         response.EnsureSuccessStatusCode();
         var json = (await response.Content.ReadFromJsonAsync<JsonElement>())!;
 
         Assert.Equal("After Update", json.GetProperty("name").GetString());
         Assert.Equal("Updated", json.GetProperty("description").GetString());
+        // Two real state changes (rename + description) → two version bumps.
+        Assert.Equal(2, json.GetProperty("version").GetInt32());
     }
 
     [Fact]
@@ -159,17 +168,24 @@ public sealed class ResourceEndpointsTests : IAsyncLifetime
         var created = await CreateResourceAsync();
         var id = created.GetProperty("id").GetGuid();
 
-        var activateResponse = await _client.PostAsync(
-            $"/api/resources/{id}/activate",
-            content: null);
+        var activateRequest = new HttpRequestMessage(
+            HttpMethod.Post,
+            $"/api/resources/{id}/activate");
+        activateRequest.Headers.TryAddWithoutValidation("If-Match", "\"0\"");
+
+        var activateResponse = await _client.SendAsync(activateRequest);
 
         activateResponse.EnsureSuccessStatusCode();
         var activateJson = (await activateResponse.Content.ReadFromJsonAsync<JsonElement>())!;
         Assert.Equal(ResourceStatus.Active.ToString(), activateJson.GetProperty("status").GetString());
 
-        var archiveResponse = await _client.PostAsync(
-            $"/api/resources/{id}/archive",
-            content: null);
+        // Activation bumped the version to 1; the archive must carry it.
+        var archiveRequest = new HttpRequestMessage(
+            HttpMethod.Post,
+            $"/api/resources/{id}/archive");
+        archiveRequest.Headers.TryAddWithoutValidation("If-Match", "\"1\"");
+
+        var archiveResponse = await _client.SendAsync(archiveRequest);
 
         archiveResponse.EnsureSuccessStatusCode();
         var archiveJson = (await archiveResponse.Content.ReadFromJsonAsync<JsonElement>())!;
@@ -182,7 +198,12 @@ public sealed class ResourceEndpointsTests : IAsyncLifetime
         var created = await CreateResourceAsync();
         var id = created.GetProperty("id").GetGuid();
 
-        var deleteResponse = await _client.DeleteAsync($"/api/resources/{id}");
+        var deleteRequest = new HttpRequestMessage(
+            HttpMethod.Delete,
+            $"/api/resources/{id}");
+        deleteRequest.Headers.TryAddWithoutValidation("If-Match", "\"0\"");
+
+        var deleteResponse = await _client.SendAsync(deleteRequest);
 
         Assert.Equal(HttpStatusCode.NoContent, deleteResponse.StatusCode);
 
@@ -227,11 +248,20 @@ public sealed class ResourceEndpointsTests : IAsyncLifetime
     {
         var created = await CreateResourceAsync();
         var id = created.GetProperty("id").GetGuid();
-        await _client.PostAsync($"/api/resources/{id}/activate", content: null);
 
-        var response = await _client.PostAsync(
-            $"/api/resources/{id}/activate",
-            content: null);
+        var firstActivate = new HttpRequestMessage(
+            HttpMethod.Post,
+            $"/api/resources/{id}/activate");
+        firstActivate.Headers.TryAddWithoutValidation("If-Match", "\"0\"");
+        (await _client.SendAsync(firstActivate)).EnsureSuccessStatusCode();
+
+        // A fresh If-Match (version 1) rules out a concurrency conflict: the
+        // 409 must come from the state transition itself.
+        var request = new HttpRequestMessage(
+            HttpMethod.Post,
+            $"/api/resources/{id}/activate");
+        request.Headers.TryAddWithoutValidation("If-Match", "\"1\"");
+        using var response = await _client.SendAsync(request);
 
         Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
         await AssertProblemDetailsAsync(response, "Conflict");
@@ -243,9 +273,13 @@ public sealed class ResourceEndpointsTests : IAsyncLifetime
         var created = await CreateResourceAsync();
         var id = created.GetProperty("id").GetGuid();
 
-        var response = await _client.PostAsync(
-            $"/api/resources/{id}/archive",
-            content: null);
+        // Fresh If-Match on a draft: the 409 is the state transition
+        // (drafts cannot be archived), not a concurrency conflict.
+        var request = new HttpRequestMessage(
+            HttpMethod.Post,
+            $"/api/resources/{id}/archive");
+        request.Headers.TryAddWithoutValidation("If-Match", "\"0\"");
+        using var response = await _client.SendAsync(request);
 
         Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
         await AssertProblemDetailsAsync(response, "Conflict");

@@ -95,6 +95,14 @@ public class ApiDbContext : DbContext
             // characters = 3,200 plus JSON punctuation/escaping, ≈3,400) with
             // headroom — see Resource.MaxTagCount and ResourceTag.MaxLength.
             .HasMaxLength(4096);
+
+        resource.Property(r => r.Version)
+            // Optimistic concurrency: EF Core includes the version loaded in
+            // this unit of work in the WHERE clause of every UPDATE, so a
+            // write based on a stale aggregate fails with
+            // DbUpdateConcurrencyException. ResourceRepository translates
+            // that into ResourceConcurrencyException (HTTP 412).
+            .IsConcurrencyToken();
     }
 
     /// <inheritdoc />

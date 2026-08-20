@@ -22,6 +22,11 @@ namespace DotNetApiPi.Api.Middleware;
 /// <see cref="ResourceNotFoundException"/> → 404 Not Found.
 /// </item>
 /// <item>
+/// <see cref="ResourceConcurrencyException"/> → 412 Precondition Failed (an
+/// optimistic-concurrency conflict: the client's <c>If-Match</c> version no
+/// longer matches the stored aggregate).
+/// </item>
+/// <item>
 /// <see cref="DomainException"/> → 409 Conflict (a state-transition conflict,
 /// e.g. activating an already archived resource).
 /// </item>
@@ -86,6 +91,7 @@ public sealed class ExceptionHandlingMiddleware
         {
             DomainInputException => StatusCodes.Status400BadRequest,
             ResourceNotFoundException => StatusCodes.Status404NotFound,
+            ResourceConcurrencyException => StatusCodes.Status412PreconditionFailed,
             DomainException => StatusCodes.Status409Conflict,
             _ => StatusCodes.Status500InternalServerError
         };
@@ -183,6 +189,7 @@ public sealed class ExceptionHandlingMiddleware
             [StatusCodes.Status400BadRequest] = "Bad request",
             [StatusCodes.Status404NotFound] = "Not found",
             [StatusCodes.Status409Conflict] = "Conflict",
+            [StatusCodes.Status412PreconditionFailed] = "Precondition failed",
             [StatusCodes.Status500InternalServerError] = "Internal server error"
         };
 
@@ -207,6 +214,7 @@ public sealed class ExceptionHandlingMiddleware
                 StatusCodes.Status400BadRequest => $"{BaseUri}/bad-request",
                 StatusCodes.Status404NotFound => $"{BaseUri}/not-found",
                 StatusCodes.Status409Conflict => $"{BaseUri}/conflict",
+                StatusCodes.Status412PreconditionFailed => $"{BaseUri}/precondition-failed",
                 StatusCodes.Status500InternalServerError => $"{BaseUri}/internal-server-error",
                 _ => "about:blank"
             };

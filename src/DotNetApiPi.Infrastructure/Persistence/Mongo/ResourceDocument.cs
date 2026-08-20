@@ -45,4 +45,12 @@ public sealed class ResourceDocument
     /// Gets or sets the resource tags (the <c>Value</c> of each tag value object).
     /// </summary>
     public List<string> Tags { get; set; } = [];
+
+    /// <summary>
+    /// Gets or sets the optimistic-concurrency version of the resource.
+    /// Replacements are filtered on this value (compare-and-swap), so a write
+    /// based on a stale document is rejected instead of overwriting a
+    /// concurrent change.
+    /// </summary>
+    public int Version { get; set; }
 }

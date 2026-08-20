@@ -39,11 +39,20 @@ public interface IResourceRepository
         CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Asynchronously retrieves all resources.
+    /// Asynchronously retrieves one page of resources, ordered
+    /// deterministically by identity (so pages do not shift under
+    /// concurrent inserts), together with the total number of resources.
     /// </summary>
+    /// <param name="page">The 1-based page number.</param>
+    /// <param name="pageSize">The maximum number of items per page.</param>
     /// <param name="cancellationToken">The token used to cancel the operation.</param>
-    /// <returns>An enumerable of all resources.</returns>
-    Task<IReadOnlyList<Resource>> GetAllAsync(
+    /// <returns>
+    /// The requested page of resources and the total number of resources in
+    /// the store (before paging).
+    /// </returns>
+    Task<(IReadOnlyList<Resource> Items, int TotalCount)> GetPageAsync(
+        int page,
+        int pageSize,
         CancellationToken cancellationToken = default);
 
     /// <summary>

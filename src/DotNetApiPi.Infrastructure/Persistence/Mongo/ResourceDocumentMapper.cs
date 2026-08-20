@@ -29,7 +29,8 @@ public static class ResourceDocumentMapper
             Status = resource.Status.ToString(),
             Tags = resource.Tags
                 .Select(static tag => tag.Value)
-                .ToList()
+                .ToList(),
+            Version = resource.Version
         };
     }
 
@@ -49,7 +50,8 @@ public static class ResourceDocumentMapper
             ParseStatus(document.Status),
             document.Tags
                 .Where(static value => !string.IsNullOrWhiteSpace(value))
-                .Select(static value => new ResourceTag(value)));
+                .Select(static value => new ResourceTag(value)),
+            document.Version);
     }
 
     /// <summary>

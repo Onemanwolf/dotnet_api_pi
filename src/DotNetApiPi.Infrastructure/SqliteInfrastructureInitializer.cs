@@ -6,12 +6,16 @@ namespace DotNetApiPi.Infrastructure;
 
 /// <summary>
 /// SQLite/EF Core implementation of <see cref="IInfrastructureInitializer"/>.
-/// Creates the database schema if it does not exist yet.
+/// Brings the database schema up to date by applying any pending EF Core
+/// migrations (see the <c>Migrations</c> folder of this project).
 /// <para>
-/// Note: <c>EnsureCreated</c> is a scaffold-friendly bootstrap that bypasses
-/// migrations. Once the schema starts evolving, switch to EF Core migrations
-/// (<c>dotnet ef migrations add ...</c> / <c>migrate</c>) and replace this
-/// initializer's body with a <c>context.Database.MigrateAsync</c> call.
+/// <b>Existing development databases:</b> databases created before the
+/// migration switch used <c>EnsureCreated</c> and therefore lack the
+/// <c>__EFMigrationsHistory</c> bookkeeping table (and any schema changes the
+/// migrations introduce, such as the <c>Version</c> column). <c>Migrate</c>
+/// cannot reconcile such a database — delete the file (<c>dotnet_api_pi.db</c>
+/// plus its <c>-wal</c>/<c>-shm</c> side files) once; the initializer recreates
+/// it from the migrations on next start.
 /// </para>
 /// </summary>
 public sealed class SqliteInfrastructureInitializer : IInfrastructureInitializer
@@ -36,15 +40,13 @@ public sealed class SqliteInfrastructureInitializer : IInfrastructureInitializer
     /// <inheritdoc />
     public async Task InitializeAsync(CancellationToken cancellationToken = default)
     {
-        _logger.LogInformation("Ensuring the SQLite database schema exists.");
+        _logger.LogInformation(
+            "Applying pending EF Core migrations to the SQLite database.");
 
-        var created = await _context.Database
-            .EnsureCreatedAsync(cancellationToken)
+        await _context.Database
+            .MigrateAsync(cancellationToken)
             .ConfigureAwait(false);
 
-        if (created)
-        {
-            _logger.LogInformation("Created the SQLite database schema.");
-        }
+        _logger.LogInformation("The SQLite database schema is up to date.");
     }
 }

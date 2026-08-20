@@ -21,6 +21,14 @@ namespace DotNetApiPi.Domain.Entities;
 /// <see cref="SetTags"/>) throws <see cref="DomainException"/>
 /// (HTTP 409 via the application layer's exception mapping).
 /// </para>
+/// <para>
+/// <see cref="Version"/> is the aggregate's optimistic-concurrency token:
+/// it starts at <c>0</c> and is incremented by exactly one for every actual
+/// state change (mutators that are a no-op for the current state — e.g.
+/// renaming to the same name — do not bump it). Persistence layers use it as
+/// a compare-and-swap guard so concurrent writers cannot silently overwrite
+/// each other.
+/// </para>
 /// </summary>
 public sealed class Resource : AggregateRoot<Guid>
 {
@@ -86,6 +94,20 @@ public sealed class Resource : AggregateRoot<Guid>
         ImmutableArray.Create<ResourceTag>();
 
     /// <summary>
+    /// Gets the optimistic-concurrency version of the resource. Starts at
+    /// <c>0</c> and is incremented by exactly one for every actual state
+    /// change (see the class-level documentation for the no-op rule).
+    /// <para>
+    /// The persistence layer uses this value as a compare-and-swap guard
+    /// (EF Core concurrency token; MongoDB replacement filter) so that a
+    /// client whose view of the aggregate is stale fails with a conflict
+    /// instead of silently overwriting a concurrent change. Set by the
+    /// persistence layer on load (private setter); never by application code.
+    /// </para>
+    /// </summary>
+    public int Version { get; private set; }
+
+    /// <summary>
     /// Creates a new <see cref="Resource"/> aggregate in the draft state and
     /// raises a <see cref="ResourceCreatedEvent"/>.
     /// </summary>
@@ -133,17 +155,24 @@ public sealed class Resource : AggregateRoot<Guid>
     /// <param name="description">The optional description of the resource.</param>
     /// <param name="status">The status of the resource.</param>
     /// <param name="tags">The tags of the resource.</param>
+    /// <param name="version">The persisted optimistic-concurrency version.</param>
     /// <returns>The reconstituted resource.</returns>
     internal static Resource Reconstitute(
         Guid id,
         ResourceName name,
         string? description,
         ResourceStatus status,
-        IEnumerable<ResourceTag>? tags)
+        IEnumerable<ResourceTag>? tags,
+        int version)
     {
         ArgumentNullException.ThrowIfNull(name);
 
-        return new Resource(id, name, description, status, NormalizeTags(tags));
+        var resource = new Resource(id, name, description, status, NormalizeTags(tags));
+
+        // Restore the persisted version without going through a mutator:
+        // reconstitution must not (and cannot) re-raise domain events.
+        resource.Version = version;
+        return resource;
     }
 
     /// <summary>
@@ -164,6 +193,7 @@ public sealed class Resource : AggregateRoot<Guid>
         }
 
         Name = name;
+        Version++;
     }
 
     /// <summary>
@@ -183,7 +213,18 @@ public sealed class Resource : AggregateRoot<Guid>
     public void SetDescription(string? description)
     {
         EnsureMutable();
-        Description = ValidateDescription(description);
+
+        var validated = ValidateDescription(description);
+
+        if (Description == validated)
+        {
+            // No actual state change: keep the version stable so that
+            // no-op writes do not invalidate other clients' ETags.
+            return;
+        }
+
+        Description = validated;
+        Version++;
     }
 
     /// <summary>
@@ -202,6 +243,7 @@ public sealed class Resource : AggregateRoot<Guid>
         }
 
         Status = ResourceStatus.Active;
+        Version++;
     }
 
     /// <summary>
@@ -219,6 +261,7 @@ public sealed class Resource : AggregateRoot<Guid>
         }
 
         Status = ResourceStatus.Archived;
+        Version++;
     }
 
     /// <summary>
@@ -248,6 +291,7 @@ public sealed class Resource : AggregateRoot<Guid>
         }
 
         Tags = Tags.Add(tag);
+        Version++;
     }
 
     /// <summary>
@@ -263,7 +307,18 @@ public sealed class Resource : AggregateRoot<Guid>
     public void SetTags(IEnumerable<ResourceTag>? tags)
     {
         EnsureMutable();
-        Tags = NormalizeTags(tags);
+
+        var normalized = NormalizeTags(tags);
+
+        if (Tags.SequenceEqual(normalized))
+        {
+            // Replacing the tag set with an identical one is a no-op: the
+            // version stays stable (see the class-level version semantics).
+            return;
+        }
+
+        Tags = normalized;
+        Version++;
     }
 
     /// <summary>

@@ -35,6 +35,11 @@ public sealed class ActivateResourceCommandHandler : ICommandHandler<ActivateRes
             cancellationToken).ConfigureAwait(false)
             ?? throw new ResourceNotFoundException(command.Id);
 
+        // Optimistic concurrency (application layer): reject a request that
+        // is based on a stale version before any mutation is applied. Maps
+        // to HTTP 412 via the exception-mapping middleware.
+        ConcurrencyPreconditions.EnsureMatches(resource, command.ExpectedVersion);
+
         resource.Activate();
         await _repository.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
 

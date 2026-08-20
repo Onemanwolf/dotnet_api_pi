@@ -33,6 +33,11 @@ public sealed class DeleteResourceCommandHandler : ICommandHandler<DeleteResourc
             cancellationToken).ConfigureAwait(false)
             ?? throw new ResourceNotFoundException(command.Id);
 
+        // Optimistic concurrency (application layer): reject a request that
+        // is based on a stale version before the aggregate is removed. Maps
+        // to HTTP 412 via the exception-mapping middleware.
+        ConcurrencyPreconditions.EnsureMatches(resource, command.ExpectedVersion);
+
         await _repository.RemoveAsync(resource, cancellationToken).ConfigureAwait(false);
         await _repository.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
 

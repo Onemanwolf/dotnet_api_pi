@@ -1,4 +1,5 @@
 using DotNetApiPi.Application.Common;
+using DotNetApiPi.Application.Common.Exceptions;
 using DotNetApiPi.Domain.Common;
 using DotNetApiPi.Domain.Entities;
 using DotNetApiPi.Domain.Repositories;
@@ -16,21 +17,40 @@ namespace DotNetApiPi.Infrastructure.Repositories;
 /// It mirrors the unit-of-work semantics of the EF Core implementation:
 /// aggregates staged through <see cref="AddAsync"/> or
 /// <see cref="RemoveAsync"/> — or loaded through the read methods and then
-/// mutated — are written when <see cref="SaveChangesAsync"/> completes, at
-/// which point the domain events they raised are dispatched and cleared.
+/// mutated — are written when <see cref="SaveChangesAsync"/> completes.
 /// Loaded-but-unmodified aggregates are skipped (the persisted document is
 /// compared against the aggregate's current state), so a plain read followed
 /// by a save performs no writes.
 /// </para>
 /// <para>
-/// Known limitation: a single <see cref="SaveChangesAsync"/> call issues
-/// independent insert/replace/delete commands. MongoDB only guarantees
-/// atomicity across writes when a multi-document transaction is used, which
-/// in turn requires a replica set. This scaffold targets a standalone single
-/// server, so a failure between commands can leave the change set partially
-/// applied (and domain events for the aggregates already written are still
-/// dispatched). If a replica set is available, wrap the commands in a
-/// client-session transaction to make the unit of work atomic.
+/// <b>Per-aggregate atomicity.</b> <see cref="SaveChangesAsync"/> processes the
+/// staged change set one aggregate at a time, in a stable (identity-sorted)
+/// order: for each aggregate it issues the single write command that covers
+/// that aggregate (insert, version-guarded replace, or delete) and only then
+/// dispatches and clears <i>that aggregate's</i> domain events. The unit of
+/// work therefore degrades in a predictable way: if a write fails or the
+/// process dies mid-save, every earlier aggregate is fully persisted <i>and</i>
+/// fully dispatched, and no later aggregate has been touched — events are
+/// never dispatched for an aggregate whose write did not succeed.
+/// </para>
+/// <para>
+/// <b>Optimistic concurrency.</b> Replacements are filtered on both the
+/// identity and the version the aggregate was loaded with
+/// (<c>Id == … AND Version == …</c>). If another writer committed a newer
+/// version in the meantime, the filter matches nothing, the affected count is
+/// zero, and <see cref="ResourceConcurrencyException"/> is thrown (HTTP 412)
+/// instead of silently overwriting the concurrent change.
+/// </para>
+/// <para>
+/// <b>Residual risk (accepted for this scaffold).</b> The writes above are
+/// still independent commands, so a failure <i>between</i> aggregates leaves
+/// the change set partially applied. True multi-document atomicity requires a
+/// MongoDB transaction, which requires a replica set; this scaffold targets a
+/// standalone single server, where transactions are unavailable. If a replica
+/// set becomes available, wrap the per-aggregate commands in a client-session
+/// transaction (one <c>IClientSessionHandle</c>, <c>StartTransactionAsync</c>
+/// before the first write, <c>CommitTransactionAsync</c> after the last) to
+/// make the whole unit of work atomic.
 /// </para>
 /// </summary>
 public sealed class MongoResourceRepository : IResourceRepository
@@ -127,12 +147,33 @@ public sealed class MongoResourceRepository : IResourceRepository
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<Resource>> GetAllAsync(
+    public async Task<(IReadOnlyList<Resource> Items, int TotalCount)> GetPageAsync(
+        int page,
+        int pageSize,
         CancellationToken cancellationToken = default)
     {
+        if (page < 1 || pageSize < 1)
+        {
+            throw new ArgumentException(
+                $"Both page and pageSize must be positive (page: {page}, pageSize: {pageSize}).",
+                nameof(page));
+        }
+
+        // Ordering by identity alone is a deterministic total order (mirrors
+        // the EF Core implementation), so pages do not shift under
+        // concurrent inserts.
+        var totalCount = await _collection
+            .CountDocumentsAsync(
+                Builders<ResourceDocument>.Filter.Empty,
+                options: null,
+                cancellationToken)
+            .ConfigureAwait(false);
+
         var documents = await _collection
             .AsQueryable()
-            .OrderBy(document => document.Id)
+            .OrderBy(static document => document.Id)
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
 
@@ -147,7 +188,7 @@ public sealed class MongoResourceRepository : IResourceRepository
             _staged[resource.Id] = new TrackedAggregate(resource, document);
         }
 
-        return resources;
+        return (resources, (int)totalCount);
     }
 
     /// <inheritdoc />
@@ -156,11 +197,17 @@ public sealed class MongoResourceRepository : IResourceRepository
     {
         var affected = 0;
 
-        // Plan the writes: inserts for new aggregates, replacements only for
-        // aggregates whose state actually diverged from the persisted document
-        // (a plain read with no mutation therefore triggers no writes).
-        var inserts = new List<ResourceDocument>();
-        var replacements = new List<(Guid Id, ResourceDocument Document)>();
+        // Plan the writes: inserts for new aggregates, version-guarded
+        // replacements only for aggregates whose state actually diverged from
+        // the persisted document (a plain read with no mutation therefore
+        // triggers no writes), and deletes for removed aggregates.
+        //
+        // The plan is processed one aggregate at a time, in identity-sorted
+        // (stable) order: each aggregate's write completes and its domain
+        // events are dispatched and cleared before the next aggregate starts,
+        // so a failure mid-save leaves the change set in a predictable
+        // per-aggregate state (see the class documentation).
+        var plan = new List<(Guid Id, TrackedAggregate? Tracked, Resource? Removed)>();
 
         foreach (var (id, tracked) in _staged)
         {
@@ -169,63 +216,92 @@ public sealed class MongoResourceRepository : IResourceRepository
                 continue;
             }
 
-            var document = ResourceDocumentMapper.ToDocument(tracked.Aggregate);
+            plan.Add((id, tracked, null));
+        }
 
-            if (tracked.Original is null)
+        foreach (var (id, removed) in _toRemove)
+        {
+            plan.Add((id, null, removed));
+        }
+
+        plan.Sort(static (left, right) => left.Id.CompareTo(right.Id));
+
+        foreach (var (id, tracked, removed) in plan)
+        {
+            if (removed is not null)
             {
-                inserts.Add(document);
+                var result = await _collection
+                    .DeleteOneAsync(
+                        Builders<ResourceDocument>.Filter.Eq(d => d.Id, id),
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                affected += (int)result.DeletedCount;
             }
-            else if (!DocumentsEqual(tracked.Original, document))
+            else if (tracked!.Original is null)
             {
-                replacements.Add((id, document));
+                // A brand-new aggregate. (Staging an AddAsync for an id that
+                // was previously loaded in the same unit of work would race
+                // the persisted document and surface as a duplicate-key
+                // error — a programming error, like EF's Add-on-detached
+                // conflicts; new ids are Guid.NewGuid, so this is
+                // unreachable through the API.)
+                await _collection
+                    .InsertOneAsync(
+                        ResourceDocumentMapper.ToDocument(tracked.Aggregate),
+                        options: null,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                affected++;
             }
-        }
+            else
+            {
+                var document = ResourceDocumentMapper.ToDocument(tracked.Aggregate);
 
-        if (inserts.Count > 0)
-        {
-            await _collection
-                .InsertManyAsync(inserts, options: null, cancellationToken)
-                .ConfigureAwait(false);
-            affected += inserts.Count;
-        }
+                if (DocumentsEqual(tracked.Original, document))
+                {
+                    // Unchanged read: no write, nothing to dispatch.
+                    continue;
+                }
 
-        foreach (var (id, document) in replacements)
-        {
-            await _collection
-                .ReplaceOneAsync(
+                // Compare-and-swap on the version the aggregate was loaded
+                // with: a concurrent write that committed a newer version in
+                // the meantime makes the filter miss and ModifiedCount stays
+                // zero.
+                var filter = Builders<ResourceDocument>.Filter.And(
                     Builders<ResourceDocument>.Filter.Eq(d => d.Id, id),
-                    document,
-                    new ReplaceOptions(),
-                    cancellationToken)
-                .ConfigureAwait(false);
-            affected++;
-        }
+                    Builders<ResourceDocument>.Filter.Eq(
+                        d => d.Version,
+                        tracked.Original.Version));
 
-        foreach (var id in _toRemove.Keys)
-        {
-            var result = await _collection
-                .DeleteOneAsync(
-                    Builders<ResourceDocument>.Filter.Eq(d => d.Id, id),
-                    cancellationToken)
-                .ConfigureAwait(false);
-            affected += (int)result.DeletedCount;
-        }
+                var result = await _collection
+                    .ReplaceOneAsync(
+                        filter,
+                        document,
+                        new ReplaceOptions(),
+                        cancellationToken)
+                    .ConfigureAwait(false);
 
-        // Dispatch the domain events raised by every staged aggregate, then
-        // clear them so they are not dispatched twice (EF Core parity).
-        var stagedAggregates = GetStagedAggregates();
-        var events = stagedAggregates
-            .Where(static aggregate => aggregate.DomainEvents.Count > 0)
-            .SelectMany(static aggregate => aggregate.DomainEvents)
-            .ToList();
+                if (result.ModifiedCount == 0)
+                {
+                    throw new ResourceConcurrencyException(id);
+                }
 
-        if (events.Count > 0)
-        {
-            await _dispatcher.DispatchAsync(events, cancellationToken).ConfigureAwait(false);
-        }
+                affected++;
+            }
 
-        foreach (var aggregate in stagedAggregates)
-        {
+            // Per-aggregate unit of work: dispatch and clear only the events
+            // raised by this aggregate now that its own write has succeeded
+            // (a later aggregate's failure cannot leave this aggregate's
+            // events behind, and a write failure above skips dispatching
+            // entirely for the failed aggregate).
+            var aggregate = removed ?? tracked!.Aggregate;
+            if (aggregate.DomainEvents.Count > 0)
+            {
+                await _dispatcher
+                    .DispatchAsync(aggregate.DomainEvents, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
             ((IClearableDomainEvents)aggregate).ClearDomainEvents();
         }
 
@@ -233,30 +309,6 @@ public sealed class MongoResourceRepository : IResourceRepository
         _toRemove.Clear();
 
         return affected;
-    }
-
-    /// <summary>
-    /// Collects the aggregates touched by the current unit of work (inserts,
-    /// updates and removals), each exactly once.
-    /// </summary>
-    private List<Resource> GetStagedAggregates()
-    {
-        var staged = new List<Resource>(_staged.Count + _toRemove.Count);
-
-        foreach (var (id, tracked) in _staged)
-        {
-            if (!_toRemove.ContainsKey(id))
-            {
-                staged.Add(tracked.Aggregate);
-            }
-        }
-
-        foreach (var resource in _toRemove.Values)
-        {
-            staged.Add(resource);
-        }
-
-        return staged;
     }
 
     /// <summary>
@@ -269,6 +321,7 @@ public sealed class MongoResourceRepository : IResourceRepository
             && string.Equals(left.Name, right.Name, StringComparison.Ordinal)
             && string.Equals(left.Description, right.Description, StringComparison.Ordinal)
             && string.Equals(left.Status, right.Status, StringComparison.Ordinal)
-            && left.Tags.SequenceEqual(right.Tags);
+            && left.Tags.SequenceEqual(right.Tags)
+            && left.Version == right.Version;
     }
 }

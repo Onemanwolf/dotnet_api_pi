@@ -119,28 +119,50 @@ public sealed class ResourceRepositoryTests
     }
 
     [Fact]
-    public async Task GetAll_ReturnsAllResources_OrderedById()
+    public async Task GetPage_ReturnsFirstPage_OrderedById()
     {
         await using var db = new InMemoryDatabase(new RecordingDomainEventDispatcher());
         var repository = new ResourceRepository(db.Context);
 
         var first = Guid.NewGuid();
         var second = Guid.NewGuid();
-        while (first > second)
-        {
-            (first, second) = (second, first);
-        }
+        var third = Guid.NewGuid();
+        var ids = new[] { first, second, third }
+            .OrderBy(static id => id)
+            .ToArray();
 
-        var firstResource = CreateWithId(first);
-        var secondResource = CreateWithId(second);
-        await db.Context.Resources.AddRangeAsync(firstResource, secondResource);
+        await db.Context.Resources.AddRangeAsync(
+            CreateWithId(ids[0]),
+            CreateWithId(ids[1]),
+            CreateWithId(ids[2]));
         await db.Context.SaveChangesAsync();
 
-        var all = await repository.GetAllAsync();
+        var (items, totalCount) = await repository.GetPageAsync(page: 1, pageSize: 2);
 
+        Assert.Equal(3, totalCount);
         Assert.Equal(
-            new[] { first, second },
-            all.Select(static resource => resource.Id).ToArray());
+            new[] { ids[0], ids[1] },
+            items.Select(static resource => resource.Id).ToArray());
+
+        // The second page carries the remainder — pages do not overlap.
+        var (pageTwo, totalCountSecond) = await repository.GetPageAsync(page: 2, pageSize: 2);
+        Assert.Equal(3, totalCountSecond);
+        Assert.Equal([ids[2]], pageTwo.Select(static resource => resource.Id).ToArray());
+    }
+
+    [Fact]
+    public async Task GetPage_PastTheEnd_ReturnsEmptyItems_WithFullCount()
+    {
+        await using var db = new InMemoryDatabase(new RecordingDomainEventDispatcher());
+        var repository = new ResourceRepository(db.Context);
+
+        await db.Context.Resources.AddAsync(CreateWithId(Guid.NewGuid()));
+        await db.Context.SaveChangesAsync();
+
+        var (items, totalCount) = await repository.GetPageAsync(page: 99, pageSize: 20);
+
+        Assert.Empty(items);
+        Assert.Equal(1, totalCount);
     }
 
     /// <summary>
@@ -154,6 +176,7 @@ public sealed class ResourceRepositoryTests
             new ResourceName($"Resource {id}"),
             null,
             Domain.Enums.ResourceStatus.Draft,
-            null);
+            null,
+            version: 0);
     }
 }
