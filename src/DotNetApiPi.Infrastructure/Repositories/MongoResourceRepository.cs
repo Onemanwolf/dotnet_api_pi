@@ -34,12 +34,12 @@ namespace DotNetApiPi.Infrastructure.Repositories;
 /// never dispatched for an aggregate whose write did not succeed.
 /// </para>
 /// <para>
-/// <b>Optimistic concurrency.</b> Replacements are filtered on both the
-/// identity and the version the aggregate was loaded with
+/// <b>Optimistic concurrency.</b> Replacements and removals are filtered on
+/// both the identity and the version the aggregate was loaded with
 /// (<c>Id == … AND Version == …</c>). If another writer committed a newer
 /// version in the meantime, the filter matches nothing, the affected count is
 /// zero, and <see cref="ResourceConcurrencyException"/> is thrown (HTTP 412)
-/// instead of silently overwriting the concurrent change.
+/// instead of silently overwriting or deleting the concurrent change.
 /// </para>
 /// <para>
 /// <b>Residual risk (accepted for this scaffold).</b> The writes above are
@@ -84,7 +84,15 @@ public sealed class MongoResourceRepository : IResourceRepository
     // database carry the original document so unchanged reads can be skipped
     // at save time.
     private readonly Dictionary<Guid, TrackedAggregate> _staged = [];
-    private readonly Dictionary<Guid, Resource> _toRemove = [];
+
+    /// <summary>
+    /// Aggregates staged for removal. <c>LoadedVersion</c> is the version the
+    /// document was loaded with (when the aggregate went through the unit of
+    /// work); it is <c>null</c> when a never-persisted aggregate is removed
+    /// before its insert is applied, in which case the delete is plain
+    /// (nothing can exist in the collection for that identity yet).
+    /// </summary>
+    private readonly Dictionary<Guid, (Resource Aggregate, int? LoadedVersion)> _toRemove = [];
 
     /// <inheritdoc />
     public Task<Resource> AddAsync(
@@ -110,9 +118,15 @@ public sealed class MongoResourceRepository : IResourceRepository
         ArgumentNullException.ThrowIfNull(resource);
 
         // Removing a never-persisted aggregate simply unstages it; otherwise
-        // the delete is applied to the database on SaveChangesAsync.
+        // the delete is applied to the database on SaveChangesAsync. The
+        // loaded version (if any) is kept so the delete can be filtered on
+        // it, like the replace path.
+        var loadedVersion = _staged.TryGetValue(resource.Id, out var tracked)
+            ? tracked.Original?.Version
+            : null;
+
         _staged.Remove(resource.Id);
-        _toRemove[resource.Id] = resource;
+        _toRemove[resource.Id] = (resource, loadedVersion);
 
         return Task.CompletedTask;
     }
@@ -207,7 +221,7 @@ public sealed class MongoResourceRepository : IResourceRepository
         // events are dispatched and cleared before the next aggregate starts,
         // so a failure mid-save leaves the change set in a predictable
         // per-aggregate state (see the class documentation).
-        var plan = new List<(Guid Id, TrackedAggregate? Tracked, Resource? Removed)>();
+        var plan = new List<(Guid Id, TrackedAggregate? Tracked, (Resource, int?)? Removed)>();
 
         foreach (var (id, tracked) in _staged)
         {
@@ -230,11 +244,30 @@ public sealed class MongoResourceRepository : IResourceRepository
         {
             if (removed is not null)
             {
-                var result = await _collection
-                    .DeleteOneAsync(
+                var (_, loadedVersion) = _toRemove[id];
+
+                // Compare-and-swap delete (same guard as the replace path,
+                // and matching EF, whose DELETE also carries the concurrency
+                // token in its WHERE): a concurrent writer that committed a
+                // newer version in the meantime makes the filter miss, so
+                // deleting would silently lose that update. A delete of a
+                // never-persisted aggregate (nothing can exist yet) is left
+                // unfiltered.
+                var filter = loadedVersion is int version
+                    ? Builders<ResourceDocument>.Filter.And(
                         Builders<ResourceDocument>.Filter.Eq(d => d.Id, id),
-                        cancellationToken)
+                        Builders<ResourceDocument>.Filter.Eq(d => d.Version, version))
+                    : Builders<ResourceDocument>.Filter.Eq(d => d.Id, id);
+
+                var result = await _collection
+                    .DeleteOneAsync(filter, cancellationToken)
                     .ConfigureAwait(false);
+
+                if (loadedVersion is not null && result.DeletedCount == 0)
+                {
+                    throw new ResourceConcurrencyException(id);
+                }
+
                 affected += (int)result.DeletedCount;
             }
             else if (tracked!.Original is null)
@@ -294,7 +327,9 @@ public sealed class MongoResourceRepository : IResourceRepository
             // (a later aggregate's failure cannot leave this aggregate's
             // events behind, and a write failure above skips dispatching
             // entirely for the failed aggregate).
-            var aggregate = removed ?? tracked!.Aggregate;
+            var aggregate = removed.HasValue
+                ? removed.Value.Item1
+                : tracked!.Aggregate;
             if (aggregate.DomainEvents.Count > 0)
             {
                 await _dispatcher

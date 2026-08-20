@@ -90,6 +90,34 @@ public sealed class EtagConcurrencyTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Update_WithIdenticalPayload_IsANoOp_ThatDoesNotBumpTheVersion()
+    {
+        var id = await CreateResourceAsync("NoOp Before");
+
+        // Bring the aggregate to version 1 with a real change, then resend a
+        // payload identical to the persisted state: the domain mutators are
+        // no-ops, so the version (and therefore the ETag) must stay put —
+        // the save issues no write and the ETag remains valid for other
+        // clients' concurrent work.
+        await UpdateVersionAsync(id, "NoOp Name", 0);
+
+        using var response = await _client.SendAsync(
+            WithIfMatch(
+                new HttpRequestMessage(HttpMethod.Put, $"/api/resources/{id}")
+                {
+                    Content = JsonContent.Create(
+                        new { name = "NoOp Name", description = (string?)null, tags = (string[]?)null })
+                },
+                version: 1));
+
+        response.EnsureSuccessStatusCode();
+
+        using var etagResponse = await _client.GetAsync($"/api/resources/{id}");
+        etagResponse.EnsureSuccessStatusCode();
+        Assert.Equal("\"1\"", etagResponse.Headers.ETag?.Tag);
+    }
+
+    [Fact]
     public async Task Update_WithStaleIfMatch_Returns412_AndDoesNotOverwrite()
     {
         var id = await CreateResourceAsync();

@@ -81,10 +81,28 @@ public sealed class DomainEventDispatcher : IDomainEventDispatcher
         var handleAsync = subscriberType
             .GetMethod(nameof(IDomainEventSubscriber<IDomainEvent>.HandleAsync))!;
 
-        var subscribers = _serviceProvider
-            .GetServices(subscriberType)
-            .Cast<object>()
-            .ToList();
+        List<object> subscribers;
+
+        try
+        {
+            subscribers = _serviceProvider
+                .GetServices(subscriberType)
+                .Cast<object>()
+                .ToList();
+        }
+        catch (Exception exception)
+        {
+            // Resolution failures (e.g. a subscriber whose constructor
+            // requires a scoped service — subscribers must be resolvable from
+            // the root provider) must not abort the dispatch of the remaining
+            // events or fail the save that already committed.
+            _logger.LogError(
+                exception,
+                "Could not resolve subscribers for domain event '{EventType}'; none were invoked.",
+                @event.GetType().Name);
+
+            return;
+        }
 
         if (subscribers.Count == 0)
         {
