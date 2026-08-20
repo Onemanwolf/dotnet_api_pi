@@ -7,8 +7,15 @@ namespace DotNetApiPi.Api.Middleware;
 /// Lightweight request-logging middleware that assigns (or echoes) a
 /// correlation identifier per request, propagates it into the logging scope so
 /// every log line written while handling the request carries it, adds it to
-/// the response header, and writes a single structured log entry describing
-/// the completed request (method, path, status, duration).
+/// the response header, stores it in <see cref="HttpContext.Items"/>, and
+/// writes a single structured log entry describing the completed request
+/// (method, path, status, duration).
+/// <para>
+/// The <see cref="HttpContext.Items"/> copy exists so the exception
+/// middleware can re-attach the identifier after
+/// <see cref="HttpResponse.Clear"/>, which wipes every previously set
+/// response header.
+/// </para>
 /// </summary>
 public sealed class CorrelationIdMiddleware
 {
@@ -16,6 +23,12 @@ public sealed class CorrelationIdMiddleware
     /// The HTTP header used to carry the correlation identifier.
     /// </summary>
     public const string HeaderName = "X-Correlation-Id";
+
+    /// <summary>
+    /// The <see cref="HttpContext.Items"/> key under which the correlation
+    /// identifier is stored for later re-attachment on error responses.
+    /// </summary>
+    public const string ContextItemKey = "DotNetApiPi.CorrelationId";
 
     private readonly RequestDelegate _next;
     private readonly ILogger<CorrelationIdMiddleware> _logger;
@@ -45,6 +58,10 @@ public sealed class CorrelationIdMiddleware
         var correlationId =
             context.Request.Headers[HeaderName].FirstOrDefault() ?? Guid.NewGuid().ToString("N");
 
+        // Store the identifier for the exception middleware (which writes
+        // the response after Response.Clear() wiped any earlier header) and
+        // on the response for the normal path.
+        context.Items[ContextItemKey] = correlationId;
         context.Response.Headers[HeaderName] = correlationId;
 
         using (_logger.BeginScope(new Dictionary<string, object?>

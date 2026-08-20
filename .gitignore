@@ -22,3 +22,6 @@ obj/
 TestResults/
 coverage*.xml
 *.coveragexml
+
+# pi-subagents run artifacts
+.pi-subagents/

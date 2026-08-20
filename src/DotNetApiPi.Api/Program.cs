@@ -1,8 +1,13 @@
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading.RateLimiting;
 using DotNetApiPi.Api.Middleware;
+using DotNetApiPi.Api.RateLimiting;
+using DotNetApiPi.Api.Results;
 using DotNetApiPi.Application;
 using DotNetApiPi.Infrastructure;
 using DotNetApiPi.Infrastructure.Persistence;
+using Microsoft.AspNetCore.Mvc;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -29,7 +34,57 @@ builder.Services
     {
         options.JsonSerializerOptions.PropertyNamingPolicy =
             System.Text.Json.JsonNamingPolicy.CamelCase;
+
+        // Raw input-formatter exception messages (which embed .NET type
+        // names) are only surfaced in binding errors under Development.
+        options.AllowInputFormatterExceptionMessages =
+            builder.Environment.IsDevelopment();
     });
+
+// A single error contract for MVC model-binding failures (invalid or
+// missing body fields, unparseable JSON): the same RFC 7807 problem+json
+// document shape as ExceptionHandlingMiddleware, instead of MVC's default
+// application/json { errors, type, traceId } document.
+builder.Services.Configure<ApiBehaviorOptions>(options =>
+{
+    options.InvalidModelStateResponseFactory = context =>
+    {
+        var problem = new ProblemDetails
+        {
+            Status = StatusCodes.Status400BadRequest,
+            Title = "Bad request",
+            // Must match the stable error-document URI scheme used by
+            // ExceptionHandlingMiddleware.
+            Type = "https://dotnet-api-pi.example/errors/bad-request",
+            Detail = "One or more validation errors occurred."
+        };
+
+        var errors = new Dictionary<string, string[]>();
+
+        foreach (var entry in context.ModelState)
+        {
+            var messages = entry.Value
+                .Errors
+                .Select(static error => error.ErrorMessage)
+                .Where(static message => !string.IsNullOrWhiteSpace(message))
+                .Select(static message => message!)
+                .ToArray();
+
+            if (messages.Length > 0)
+            {
+                errors[entry.Key] = messages;
+            }
+        }
+
+        if (errors.Count > 0)
+        {
+            // RFC 7807 extension: per-property validation issues.
+            problem.Extensions["errors"] = errors;
+        }
+
+        return new ProblemJsonResult(problem);
+    };
+});
 
 // Add Open API support (Swagger) for convenience. It is only *surfaced* in
 // Development (see below) so the API documentation is not exposed in
@@ -50,25 +105,76 @@ builder.Services.AddCors(options => options.AddPolicy(
         .AllowAnyMethod()
         .AllowAnyHeader()));
 
-// A global fixed-window rate limiter as a first line of defence against
-// abuse. It is only applied outside Development so local tooling and
-// integration tests are not throttled.
+// A fixed-window rate limiter as a first line of defence against abuse,
+// partitioned per caller: each client IP gets its own budget (100
+// requests/minute), so a single noisy client cannot exhaust a global budget
+// and lock out everyone else. It is only applied outside Development so
+// local tooling and integration tests are not throttled. Rejected requests
+// receive the API's standard problem+json contract with a Retry-After
+// header.
 var fixedWindowOptions = new FixedWindowRateLimiterOptions
 {
     Window = TimeSpan.FromMinutes(1),
     PermitLimit = 100,
+    // QueueLimit = 0: once a caller's window budget is exhausted the request
+    // is rejected immediately with 429 (Retry-After below) instead of being
+    // queued.
     QueueLimit = 0
 };
+
+// RFC 7807 serialization options for the rate-limit rejection handler
+// (ProblemDetails carries explicit [JsonPropertyName] attributes; null
+// members are omitted to match the exception middleware's output).
+var problemJsonOptions = new JsonSerializerOptions
+{
+    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+};
+
 builder.Services.AddRateLimiter(options =>
 {
     options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
-    // A single (global) fixed-window limiter for every request; the
-    // partition key is a constant.
+
+    // One fixed-window budget per caller, partitioned by the caller's remote
+    // IP address; requests without a resolvable address share the
+    // "anonymous" partition (see RateLimitKeys).
     options.GlobalLimiter = System.Threading.RateLimiting.PartitionedRateLimiter
         .Create<HttpContext, string>(
-            _ => RateLimitPartition.GetFixedWindowLimiter(
-                "global",
+            httpContext => RateLimitPartition.GetFixedWindowLimiter(
+                RateLimitKeys.For(httpContext),
                 _ => fixedWindowOptions));
+
+    // Rejections follow the same RFC 7807 problem+json contract as
+    // ExceptionHandlingMiddleware. Retry-After is the window length: the
+    // exact fixed-window boundary is internal to the limiter, so reporting
+    // the full window is a safe upper bound rather than telling the client
+    // to retry too early.
+    options.OnRejected = async (rejectionContext, cancellationToken) =>
+    {
+        var response = rejectionContext.HttpContext.Response;
+
+        if (response.HasStarted)
+        {
+            return;
+        }
+
+        response.StatusCode = StatusCodes.Status429TooManyRequests;
+        response.ContentType = "application/problem+json";
+        response.Headers["Retry-After"] =
+            ((int)fixedWindowOptions.Window.TotalSeconds)
+                .ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+        var problem = new ProblemDetails
+        {
+            Status = StatusCodes.Status429TooManyRequests,
+            Title = "Too many requests",
+            Type = "https://dotnet-api-pi.example/errors/too-many-requests"
+        };
+
+        var json = JsonSerializer.Serialize(problem, problemJsonOptions);
+        await response
+            .WriteAsync(json, cancellationToken)
+            .ConfigureAwait(false);
+    };
 });
 
 // HTTPS redirection is enabled only when an HTTPS port is configured through
@@ -123,7 +229,11 @@ if (app.Environment.IsDevelopment())
 }
 
 app.MapControllers();
-app.MapHealthChecks("/health");
+
+// The liveness/readiness probe must stay reachable even while rate limiting
+// is active (a throttled pod would otherwise be killed by the container
+// orchestrator, and one noisy client could take down the whole deployment).
+app.MapHealthChecks("/health").DisableRateLimiting();
 
 app.Run();
 

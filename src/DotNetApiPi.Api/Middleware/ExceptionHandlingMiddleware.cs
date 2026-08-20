@@ -15,8 +15,8 @@ namespace DotNetApiPi.Api.Middleware;
 /// Mapping:
 /// <list type="bullet">
 /// <item>
-/// <see cref="DomainInputException"/> / <see cref="ValidationException"/> →
-/// 400 Bad Request (the client sent invalid input).
+/// <see cref="DomainInputException"/> → 400 Bad Request (the client sent
+/// invalid input).
 /// </item>
 /// <item>
 /// <see cref="ResourceNotFoundException"/> → 404 Not Found.
@@ -85,7 +85,6 @@ public sealed class ExceptionHandlingMiddleware
         var statusCode = exception switch
         {
             DomainInputException => StatusCodes.Status400BadRequest,
-            ValidationException => StatusCodes.Status400BadRequest,
             ResourceNotFoundException => StatusCodes.Status404NotFound,
             DomainException => StatusCodes.Status409Conflict,
             _ => StatusCodes.Status500InternalServerError
@@ -154,6 +153,22 @@ public sealed class ExceptionHandlingMiddleware
             // error-document URI is used instead of a playful third-party one.
             Type = ProblemTypes.Get(statusCode)
         };
+
+        // Response.Clear() wiped the headers set earlier — including the
+        // X-Correlation-Id that CorrelationIdMiddleware assigned before the
+        // exception was thrown. Re-attach it (response header and
+        // problem+json extension) so error responses stay correlatable with
+        // the same log line as successful responses.
+        if (context.Items.TryGetValue(
+                CorrelationIdMiddleware.ContextItemKey,
+                out object? correlationId))
+        {
+            // CorrelationIdMiddleware always stores a non-null string here.
+            var correlationValue = (string)correlationId!;
+            context.Response.Headers[CorrelationIdMiddleware.HeaderName] =
+                correlationValue;
+            problem.Extensions["correlationId"] = correlationValue;
+        }
 
         var json = JsonSerializer.Serialize(problem, JsonOptions);
         await context.Response
