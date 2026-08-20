@@ -8,6 +8,8 @@ using DotNetApiPi.Application;
 using DotNetApiPi.Infrastructure;
 using DotNetApiPi.Infrastructure.Persistence;
 using Microsoft.AspNetCore.Mvc;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -95,15 +97,33 @@ builder.Services.AddSwaggerGen();
 // Health checks for container orchestrators and load balancers.
 builder.Services.AddHealthChecks();
 
-// A permissive CORS policy so browser clients can consume the API
-// cross-origin. Tighten it (explicit origins) before exposing the API on the
-// Internet.
+// CORS (audit finding F-14): an explicit origin allowlist read from the
+// "Cors:AllowedOrigins" configuration section, e.g.
+//   appsettings.json:  "Cors": { "AllowedOrigins": ["https://admin.example.com"] }
+//   environment:       Cors__AllowedOrigins__0=https://admin.example.com
+// An empty or absent list allows NO cross-origin requests (same-origin
+// only) — the policy never falls back to a wildcard. Only browsers with an
+// Origin that is in the list may make cross-origin requests; for those
+// allowed origins all methods and headers are permitted.
+var allowedOrigins = builder.Configuration
+    .GetSection("Cors:AllowedOrigins")
+    .Get<string[]>()
+    ?? [];
+
 builder.Services.AddCors(options => options.AddPolicy(
     CorsPolicyNames.Default,
     policy => policy
-        .AllowAnyOrigin()
+        .WithOrigins(allowedOrigins)
         .AllowAnyMethod()
         .AllowAnyHeader()));
+
+// AUTHENTICATION POSTURE (explicit decision, audit finding F-14): this
+// scaffold ships WITHOUT authentication by design — it is not an
+// internet-facing product yet, and half-built auth middleware would create
+// a false sense of security. The current abuse mitigations are per-caller
+// rate limiting (below) and the unified RFC 7807 error contract (no stack
+// traces or internal type names in responses). Add real authentication
+// (e.g. OIDC bearer tokens) before exposing the API publicly.
 
 // A fixed-window rate limiter as a first line of defence against abuse,
 // partitioned per caller: each client IP gets its own budget (100
@@ -177,6 +197,41 @@ builder.Services.AddRateLimiter(options =>
     };
 });
 
+// Observability (audit finding F-21): W3C trace-context propagation is
+// active for every request (the AspNetCore instrumentation emits/propagates
+// the traceparent header), and metrics/traces are exported over OTLP only
+// when explicitly enabled — through the Otel:Enabled configuration key
+// (Otel__Enabled=true) or the OTEL_ENABLED=true environment variable — so
+// the scaffold runs with zero overhead and no failing exporter connections
+// by default. The trace context coexists with the X-Correlation-Id
+// middleware: the correlation id correlates operational log lines, the W3C
+// trace context is for distributed tracing.
+const string otelServiceName = "dotnet-api-pi";
+const string otelServiceVersion = "1.0.0";
+var otelEnabled = builder.Configuration["Otel:Enabled"] == "true"
+    || Environment.GetEnvironmentVariable("OTEL_ENABLED") == "true";
+var otelEndpoint = new Uri(
+    builder.Configuration["Otel:Exporter:Otlp:Endpoint"]
+    ?? Environment.GetEnvironmentVariable("OTEL_EXPORTER_OTLP_ENDPOINT")
+    ?? "http://localhost:4317");
+
+builder.Services
+    .AddOpenTelemetry()
+    .ConfigureResource(resource => resource.AddService(
+        otelServiceName,
+        otelServiceVersion))
+    .WithTracing(tracing =>
+    {
+        var pipeline = tracing
+            .AddAspNetCoreInstrumentation()
+            .AddHttpClientInstrumentation();
+
+        if (otelEnabled)
+        {
+            pipeline.AddOtlpExporter(options => options.Endpoint = otelEndpoint);
+        }
+    });
+
 // HTTPS redirection is enabled only when an HTTPS port is configured through
 // ASPNETCORE_HTTPS_PORT — the case under `dotnet run` with the https launch
 // profile, or in a container when both ASPNETCORE_HTTPS_PORT and an HTTPS
@@ -249,7 +304,9 @@ public partial class Program;
 public static class CorsPolicyNames
 {
     /// <summary>
-    /// The default (permissive, development-oriented) CORS policy name.
+    /// The default CORS policy: an explicit origin allowlist configured
+    /// through <c>Cors__AllowedOrigins</c> (empty = same-origin only, never
+    /// a wildcard).
     /// </summary>
     public const string Default = "Default";
 }

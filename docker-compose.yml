@@ -3,10 +3,15 @@
 # environment variables) to use the Mongo storage provider instead of the
 # default embedded SQLite database.
 #
-# SECURITY NOTE: the MongoDB container runs with NO authentication and its
-# data directory is a named volume. This is intentional for a local
-# development scaffold only — never run this configuration (exposed port,
-# no auth) on a network other than loopback/localhost.
+# CREDENTIALS: the MongoDB root credentials are parameterized through the
+# MONGO_USER / MONGO_PASSWORD variables (see .env.example; copy it to .env
+# and adjust — .env is gitignored). The values below are the built-in
+# defaults used when .env is absent.
+#
+# SECURITY NOTE: authentication is enabled, but the default credentials are
+# well known and the ports are exposed on the host. This is intentional for
+# a local development scaffold only — never run this configuration on a
+# network other than loopback/localhost without changing MONGO_PASSWORD.
 services:
   api:
     build:
@@ -19,7 +24,9 @@ services:
       - "8090:8080"
     environment:
       Storage__Provider: mongo
-      Storage__MongoConnectionString: "mongodb://mongo:27017"
+      # The root user is created in the admin database by
+      # MONGO_INITDB_ROOT_*, hence authSource=admin.
+      Storage__MongoConnectionString: "mongodb://${MONGO_USER:-dotnetapipi}:${MONGO_PASSWORD:-secret-dev}@mongo:27017?authSource=admin"
       Storage__MongoDatabaseName: dotnet_api_pi
     depends_on:
       mongo:
@@ -37,7 +44,11 @@ services:
   mongo:
     image: mongo:8
     container_name: dotnet-api-pi-mongo
-    # No authentication is configured — see the SECURITY NOTE above.
+    # Root credentials (audit finding F-20): MONGO_INITDB_ROOT_* creates the
+    # admin-DB root user on first initialization. Override via .env.
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:-dotnetapipi}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-secret-dev}
     # The host port is mapped to 27018 so the scaffold keeps working even
     # when a local MongoDB already occupies 27017. Inside the compose
     # network the API always reaches Mongo at mongo:27017.
@@ -45,8 +56,10 @@ services:
       - "27018:27017"
     volumes:
       - mongo-data:/data/db
+    # The healthcheck authenticates with the same credentials (the previous
+    # unauthenticated ping is no longer valid).
     healthcheck:
-      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      test: ["CMD-SHELL", "mongosh --quiet -u '${MONGO_USER:-dotnetapipi}' -p '${MONGO_PASSWORD:-secret-dev}' --authenticationDatabase admin --eval \"db.adminCommand('ping')\""]
       interval: 5s
       timeout: 5s
       retries: 20

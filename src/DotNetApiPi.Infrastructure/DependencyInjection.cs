@@ -1,4 +1,5 @@
 using DotNetApiPi.Application.Common;
+using DotNetApiPi.Domain.Events;
 using DotNetApiPi.Domain.Repositories;
 using DotNetApiPi.Infrastructure.EventHandlers;
 using DotNetApiPi.Infrastructure.Persistence;
@@ -32,6 +33,16 @@ public static class DependencyInjection
         ArgumentNullException.ThrowIfNull(options);
 
         services.AddScoped<IDomainEventDispatcher, DomainEventDispatcher>();
+
+        // Domain-event subscribers (audit finding F-21): the dispatcher
+        // resolves IDomainEventSubscriber{TEvent> registrations from the
+        // container when an event is dispatched. Singletons are appropriate
+        // for stateless subscribers (like the logging one below); scoped
+        // subscribers can be registered here too, since the dispatcher is
+        // scoped and resolves them from the scoped provider.
+        services.AddSingleton<
+            IDomainEventSubscriber<ResourceCreatedEvent>,
+            ResourceCreatedEventLogSubscriber>();
 
         switch (options.Provider)
         {
