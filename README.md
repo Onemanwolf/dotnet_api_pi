@@ -288,11 +288,13 @@ exposing the API publicly.
 - **Structured logging** — one structured request log line per request
   (method, path, status, duration) plus the correlation id on every log line.
 - **OpenTelemetry** — W3C trace-context propagation is active for every
-  request (ASP.NET Core + HttpClient instrumentation). Exporting over OTLP is
-  opt-in to keep the scaffold free of failing exporter connections: set
-  `Otel:Enabled=true` (env `Otel__Enabled=true`) or `OTEL_ENABLED=true` to
-  enable; the endpoint comes from `Otel:Exporter:Otlp:Endpoint`
+  request (ASP.NET Core + HttpClient instrumentation). Traces and metrics are
+  collected in-process and exported over OTLP only when explicitly enabled:
+  set `Otel:Enabled=true` (env `Otel__Enabled=true`) or `OTEL_ENABLED=true`
+  to enable; the endpoint comes from `Otel:Exporter:Otlp:Endpoint`
   (env `OTEL_EXPORTER_OTLP_ENDPOINT`), default `http://localhost:4317`.
+  Metrics include the standard .NET runtime / ASP.NET Core / HTTP client
+  instrumentation plus the outbox relay counters (see “Outbox operations”).
 - **Domain events** — the unit of work dispatches aggregate domain events to
   `IDomainEventSubscriber<TEvent>` subscribers after the write commits. The
   built-in `ResourceCreatedEventLogSubscriber` logs resource creations;
@@ -312,11 +314,12 @@ The persistence backend is selected from the `Storage` configuration section
 | `Storage:MongoDatabaseName` | `dotnet_api_pi` | Mongo database name |
 | `Kafka:BootstrapServers` | *(empty)* | Comma-separated broker list (e.g. `kafka:19092` in compose). When empty, the outbox relay is not started — events stay `Pending` in the outbox collection |
 | `Kafka:Topic` | `resource-events` | Topic the outbox relay publishes to |
+| `Kafka:MessageTimeoutMs` | `30000` | Broker message timeout: hard deadline (incl. retries) for one produce. Bounds the worst-case per-message publish delay — the claim lease must outlive the batch drain (`ceil(BatchSize / PublishConcurrency)` rounds × this timeout) |
 | `Outbox:PollIntervalMs` | `1000` | Relay poll interval |
 | `Outbox:BatchSize` | `50` | Max events claimed per poll |
 | `Outbox:PublishConcurrency` | `8` | Max in-flight publishes (per-resource ordering preserved) |
 | `Outbox:MaxAttempts` | `5` | Publish attempts before an event is marked `Dead` |
-| `Outbox:LeaseSeconds` | `30` | Claim lease; expired leases are reclaimable (crash recovery) |
+| `Outbox:LeaseSeconds` | `240` | Claim lease; expired leases are reclaimable (crash recovery). Must be ≥ the worst-case batch drain (`ceil(BatchSize / PublishConcurrency)` × `Kafka:MessageTimeoutMs` — 75 s at the defaults); if it isn't, the relay logs a warning at startup and a slow broker can cause a concurrent relay to double-publish (at-least-once tolerates the duplicate) |
 | `Outbox:BaseRetryDelayMs` | `5000` | Base of the exponential retry backoff |
 
 Both providers implement the same `IResourceRepository` contract, so the API
@@ -400,12 +403,19 @@ in-process (log subscriber) and never touches `outbox_events` or Kafka.
   // in mongosh, as the configured user:
   db.outbox_events.updateMany(
     { status: 3 },
-    { $set: { status: 0, attempts: 0, claimableAtUtc: new Date() }, $unset: { lastError: "", leaseUntilUtc: "" } })
+    { $set: { status: 0, attempts: 0, claimableAtUtc: new Date() }, $unset: { lastError: "" } })
   // the relay picks the rows up within one poll interval.
   ```
 
   Replayed events are re-delivered to Kafka; consumers must tolerate this
   (dedupe on `x-event-id` / `eventId` — delivery is at-least-once by design).
+- **Metrics** (OpenTelemetry; exported when `Otel:Enabled` is set): the relay
+  emits three counters, each tagged by the stable `event.type` wire name —
+  `dotnet_api_pi.outbox.published` (events published to Kafka and recorded as
+  `Published`), `dotnet_api_pi.outbox.failed_attempts` (failed attempts that
+  went back to `Pending` with backoff) and `dotnet_api_pi.outbox.dead` (rows
+  that exhausted the retry budget — alert on this one; it is the operator
+  action item above). Dead transitions are also logged at `Critical`.
 - **Indexes** (created by the initializer): `status_claimableAtUtc`
   (serves the relay's claim query, filter + sort, index-only) and
   `resourceId` (per-resource lookups).

@@ -41,8 +41,19 @@ public sealed class OutboxOptions
     /// <summary>
     /// Claim lease length: a <c>Publishing</c> row whose lease expired is
     /// treated as a relay crash leftover and re-claimed.
+    /// <para>
+    /// The lease must outlive the worst-case drain of one full batch:
+    /// <c>ceil(BatchSize / PublishConcurrency)</c> sequential rounds,
+    /// each bounded by <c>Kafka:MessageTimeoutMs</c> (the broker message
+    /// timeout). With the defaults (50 / 8 / 30 s) that is 75 s; 240 s
+    /// leaves headroom for broker degradation. If you shrink the lease
+    /// below the drain time, the relay logs a warning at startup — a slow
+    /// broker will then expire claims mid-batch and a concurrent relay can
+    /// double-publish (at-least-once tolerates the duplicate, but the
+    /// setting is misconfigured, not a behavior).
+    /// </para>
     /// </summary>
-    public int LeaseSeconds { get; init; } = 30;
+    public int LeaseSeconds { get; init; } = 240;
 
     /// <summary>
     /// Base retry delay; the actual backoff after attempt <c>n</c> is

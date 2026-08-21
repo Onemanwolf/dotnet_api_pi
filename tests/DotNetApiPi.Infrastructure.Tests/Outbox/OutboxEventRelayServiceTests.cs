@@ -1,5 +1,6 @@
 using DotNetApiPi.Infrastructure.Kafka;
 using DotNetApiPi.Infrastructure.Outbox;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 
@@ -122,8 +123,7 @@ public sealed class OutboxEventRelayServiceTests : IDisposable
         store.Add(stuck with
         {
             Status = OutboxEventStatus.Publishing,
-            ClaimableAtUtc = _time.GetUtcNow().UtcDateTime - TimeSpan.FromSeconds(60),
-            LeaseUntilUtc = _time.GetUtcNow().UtcDateTime - TimeSpan.FromSeconds(60)
+            ClaimableAtUtc = _time.GetUtcNow().UtcDateTime - TimeSpan.FromSeconds(60)
         });
 
         await UntilAsync(
@@ -202,6 +202,56 @@ public sealed class OutboxEventRelayServiceTests : IDisposable
         return relay;
     }
 
+    [Fact(Timeout = 20_000)]
+    public async Task Relay_Start_LogsWarning_WhenLeaseBelowWorstCaseDrainTime()
+    {
+        // W-2: 50 events / 8 concurrent = 7 sequential rounds (ceiling),
+        // each bounded by the 30 s broker message timeout ≈ 210 s of drain;
+        // a 30 s lease is far below that, so the guard must fire exactly
+        // once, with all the numbers an operator needs to fix it.
+        var logger = new CapturingLogger();
+        var relay = new OutboxEventRelayService(
+            new InMemoryOutboxStore(),
+            new FakePublisher(static (_, _, _, _) => new KafkaPublishResult("resource-events", 0, 0)),
+            Options.Create(new OutboxOptions { PollIntervalMs = 60_000, LeaseSeconds = 30 }),
+            Options.Create(new KafkaOptions { BootstrapServers = "test:19092", MessageTimeoutMs = 30_000 }),
+            logger,
+            _time);
+
+        _relays.Add(relay);
+        await relay.StartAsync(CancellationToken.None);
+
+        var warnings = logger.Entries.Where(static e => e.Level == LogLevel.Warning).ToList();
+        Assert.Single(warnings);
+
+        var message = warnings[0].Message;
+        Assert.Contains("Outbox lease (30 s)", message);
+        Assert.Contains("50 events / 8 concurrent / 30000 ms", message);
+        Assert.Contains("≈ 210 s", message);
+    }
+
+    [Fact(Timeout = 20_000)]
+    public async Task Relay_Start_DoesNotLogLeaseWarning_WhenLeaseCoversWorstCaseDrain()
+    {
+        // Default lease (240 s) covers the worst-case drain at the default
+        // batch/concurrency/timeout (210 s) → quiet start.
+        var logger = new CapturingLogger();
+        var relay = new OutboxEventRelayService(
+            new InMemoryOutboxStore(),
+            new FakePublisher(static (_, _, _, _) => new KafkaPublishResult("resource-events", 0, 0)),
+            Options.Create(new OutboxOptions { PollIntervalMs = 60_000 }),
+            Options.Create(new KafkaOptions { BootstrapServers = "test:19092" }),
+            logger,
+            _time);
+
+        _relays.Add(relay);
+        await relay.StartAsync(CancellationToken.None);
+
+        Assert.DoesNotContain(
+            logger.Entries,
+            static e => e.Level == LogLevel.Warning && e.Message.StartsWith("Outbox lease"));
+    }
+
     private OutboxEventRecord PendingEvent(
         Guid eventId,
         string eventType,
@@ -222,7 +272,6 @@ public sealed class OutboxEventRelayServiceTests : IDisposable
             now,
             now, // claimable immediately
             Guid.Empty, // assigned on first claim
-            null,
             null,
             null,
             null,
@@ -341,7 +390,6 @@ public sealed class OutboxEventRelayServiceTests : IDisposable
                         Status = OutboxEventStatus.Publishing,
                         ClaimId = Guid.NewGuid(),
                         ClaimableAtUtc = leaseUntil,
-                        LeaseUntilUtc = leaseUntil,
                         LastError = null
                     };
                     _rows[claimed.EventId] = updated;
@@ -374,8 +422,7 @@ public sealed class OutboxEventRelayServiceTests : IDisposable
                     var takenOver = row with
                     {
                         ClaimId = Guid.NewGuid(),
-                        ClaimableAtUtc = row.ClaimableAtUtc,
-                        LeaseUntilUtc = row.LeaseUntilUtc
+                        ClaimableAtUtc = row.ClaimableAtUtc
                     };
                     _rows[eventId] = takenOver;
                     row = takenOver;
@@ -393,7 +440,6 @@ public sealed class OutboxEventRelayServiceTests : IDisposable
                         PublishedAtUtc = publishedAtUtc,
                         TopicPartition = partition,
                         Offset = offset,
-                        LeaseUntilUtc = null,
                         LastError = null
                     };
                 }
@@ -431,7 +477,6 @@ public sealed class OutboxEventRelayServiceTests : IDisposable
                             ? OutboxEventStatus.Dead
                             : OutboxEventStatus.Pending,
                         Attempts = attempts,
-                        LeaseUntilUtc = null,
                         LastError = error
                     };
 
@@ -508,5 +553,34 @@ public sealed class OutboxEventRelayServiceTests : IDisposable
         public DateTimeOffset UtcNow { get; set; } = DateTimeOffset.UtcNow;
 
         public override DateTimeOffset GetUtcNow() => UtcNow;
+    }
+
+    /// <summary>
+    /// Captures log entries (level + rendered message) for assertions on
+    /// the relay's startup behavior.
+    /// </summary>
+    private sealed class CapturingLogger : ILogger<OutboxEventRelayService>
+    {
+        private readonly object _gate = new();
+
+        public List<(LogLevel Level, string Message)> Entries { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull
+            => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            lock (_gate)
+            {
+                Entries.Add((logLevel, formatter(state, exception)));
+            }
+        }
     }
 }

@@ -21,19 +21,15 @@ namespace DotNetApiPi.Infrastructure.Outbox;
 /// <param name="Attempts">Number of publish attempts made so far.</param>
 /// <param name="CreatedAtUtc">When the row was written (inside the
 /// aggregate's transaction).</param>
-/// <param name="ClaimableAtUtc">The single claim gate: a row is claimable
-/// on/after this instant. Set to the creation time on insert, to the lease
-/// expiry while <c>Publishing</c>, and to the backoff time when a failed
-/// attempt sends the row back to <c>Pending</c>. Collapsing backoff gate and
-/// lease into one field lets the claim query be a single index range
-/// (no <c>$or</c>, no in-memory sort).</param>
+/// <param name="ClaimableAtUtc">The single claim gate: when the row becomes
+/// claimable again — the creation time for a fresh row, the backoff deadline
+/// after a failed attempt, and the lease expiry while <c>Publishing</c>.
+/// Collapsing backoff gate and lease into one field lets the claim query be
+/// a single index range (no <c>$or</c>, no in-memory sort).</param>
 /// <param name="ClaimId">Identity of the current claim: a fresh GUID set by
 /// the claiming relay. The publish/failure updates only apply while this
 /// value still matches, so a late writer whose lease expired can never
 /// overwrite the row a newer claimant owns.</param>
-/// <param name="LeaseUntilUtc">Claim lease: a <c>Publishing</c> row whose
-/// lease has expired is treated as a crash leftover and re-claimable
-/// (<c>null</c> when not claimed).</param>
 /// <param name="PublishedAtUtc">Set when the Kafka ack arrived.</param>
 /// <param name="TopicPartition">Kafka partition the event landed in (set on
 /// publish).</param>
@@ -52,7 +48,6 @@ public sealed record OutboxEventRecord(
     DateTime CreatedAtUtc,
     DateTime ClaimableAtUtc,
     Guid ClaimId,
-    DateTime? LeaseUntilUtc,
     DateTime? PublishedAtUtc,
     int? TopicPartition,
     long? Offset,

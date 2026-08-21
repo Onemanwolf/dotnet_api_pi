@@ -428,3 +428,74 @@ docker compose up -d --build
 # Kafka from the host: kcat -b localhost:29092 -C -t resource-events
 docker compose down   # add -v to delete the mongo + kafka data volumes
 ```
+
+## Outbox review round 3 (2026-08-20)
+
+`OUTBOX_CORRECTIONS_SPEC.md` (W-1…W-6) — a second external review of the
+round-2 outbox work. All items addressed; full local gate green
+(Release `--warnaserror` build, 197 tests).
+
+### What changed
+
+- **W-1 — claim query is index-only.** The claim `FindOneAndUpdate` sorts on
+  `claimableAtUtc` alone (the second key of `status_claimableAtUtc`) with
+  no `_id` tie-break — the tie-break made the sort pattern wider than the
+  index and forced a blocking in-memory SORT. MongoDB 8 serves the claim
+  (filter `status IN (Pending, Publishing)` + `claimableAtUtc <= now`) via
+  a `SORT_MERGE` of per-status index scans; an integration test asserts the
+  explain plan has no blocking SORT stage and examines a single document
+  over a 200-row backlog. Ties on `claimableAtUtc` are arbitrary by design
+  (fairness, not ordering).
+- **W-2 — broker timeout configurable + lease guard.**
+  `Kafka:MessageTimeoutMs` (default 30000) replaces the hardcoded broker
+  `message.timeout.ms`. At relay startup a guard compares
+  `Outbox:LeaseSeconds` against the worst-case batch drain
+  (`ceil(batchSize / publishConcurrency) * messageTimeoutMs / 1000` ≈ 210 s
+  at defaults) and logs a warning when the lease cannot cover it (a too-short
+  lease means a live publisher's row gets reclaimed mid-flight — the
+  lost-claim path, on every event). Default `LeaseSeconds` raised 30 → 240.
+  Unit tests pin both warning and quiet-start behavior.
+- **W-3 — dead `LeaseUntilUtc` removed** from the record, document, store,
+  repository and tests: `claimableAtUtc` is the single claim gate (creation
+  time when `Pending`, lease expiry when `Publishing`, backoff after a
+  failure). No reader ever existed.
+- **W-4 — outbox metrics.** New `OutboxMetrics` on meter
+  `DotNetApiPi.Outbox`: `dotnet_api_pi.outbox.published`,
+  `dotnet_api_pi.outbox.failed_attempts`, `dotnet_api_pi.outbox.dead`, each
+  tagged by the stable `event.type` wire name. The relay increments on
+  publish success / retryable failure / dead transition (dead also logs at
+  `Critical` when the terminal mark was recorded). The API registers
+  `AddRuntimeInstrumentation` / `AddAspNetCoreInstrumentation` /
+  `AddHttpClientInstrumentation` and an OTLP metrics exporter when
+  `OTEL_ENDPOINT` is set.
+- **W-5 — Testcontainers integration suite.** New
+  `tests/.../Integration/` (trait `Category=Integration`, skipped with
+  `--filter "Category!=Integration"`): real `mongo:8` replica set
+  (Testcontainers.MongoDb) + real KRaft broker
+  (`confluentinc/cp-kafka:7.8.10`, pinned host port,
+  `KAFKA_ADVERTISED_LISTENERS` set explicitly — the module leaves it unset,
+  which breaks host-side clients). 8 tests: aborted unit-of-work leaves no
+  outbox row **and** no aggregate write; a duplicate outbox identity inside
+  one transaction aborts the caller's session (the append joins the caller's
+  `IClientSessionHandle` — the store-level duplicate-key abort is the
+  load-bearing check); committed UoW writes aggregate + outbox atomically;
+  32-row backlog drained by two concurrent claimants with zero overlap;
+  a `MarkPublishedAsync` with a foreign `claimId` is a no-op that leaves the
+  row untouched; an expired 1 s lease makes the row reclaimable under a
+  fresh `claimId`; the explain plan is index-only (above); and end-to-end a
+  row's envelope + `x-event-id` header is published by the production
+  `ConfluentKafkaEventPublisher` to the real broker and consumed back.
+- **W-6 — push + CI.** Pushed; CI run verified on GitHub (build gate +
+  test suite; Docker is available in CI, so the `Category=Integration`
+  tests run there too).
+
+### Notes
+
+- MongoDB.Driver 3.11 has no typed `Explain` API and no `ExplainResult`
+  type; the plan assertion runs the raw `explain` command through
+  `IMongoDatabase.RunCommandAsync(Command<BsonDocument>)`.
+- `Counter<long>.Add` has no `IEnumerable<KeyValuePair<string, object?>>`
+  overload in .NET 10 — tag lists pass as arrays.
+- xunit analyzers under `-warnaserror` forbid `ConfigureAwait(false)` and
+  blocking task operations in test methods — the integration tests follow
+  the existing test style (plain `await`).

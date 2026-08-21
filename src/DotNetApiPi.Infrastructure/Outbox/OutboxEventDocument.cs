@@ -97,13 +97,6 @@ public sealed class OutboxEventDocument
     public Guid ClaimId { get; set; }
 
     /// <summary>
-    /// Gets or sets the claim lease (UTC); a <c>Publishing</c> row whose
-    /// lease expired is re-claimable as a crash leftover.
-    /// </summary>
-    [BsonElement("leaseUntilUtc")]
-    public DateTime? LeaseUntilUtc { get; set; }
-
-    /// <summary>
     /// Gets or sets when the Kafka ack arrived (UTC).
     /// </summary>
     [BsonElement("publishedAtUtc")]

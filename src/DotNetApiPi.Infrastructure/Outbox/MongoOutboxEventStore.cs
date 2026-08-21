@@ -10,9 +10,13 @@ namespace DotNetApiPi.Infrastructure.Outbox;
 /// The claim is a single <c>findAndModify</c> (atomic on MongoDB), so
 /// competing relay instances never claim the same row. The claim filter is
 /// one index range — <c>status IN (Pending, Publishing) AND
-/// claimableAtUtc &lt;= now</c>, ordered by <c>claimableAtUtc</c> — which
-/// the compound index serves without an in-memory sort even when a broker
-/// outage has built up a large backlog. Publishing/failure updates are
+/// claimableAtUtc &lt;= now</c> — and the sort is on <c>claimableAtUtc</c>
+/// alone (the index's first key), so the whole claim is served by the
+/// <c>status_claimableAtUtc</c> index without a blocking in-memory sort even
+/// when a broker outage has built up a large backlog. (Sorting on a field
+/// outside the index — e.g. an <c>_id</c> tie-break — would force MongoDB
+/// to sort the whole backlog in memory before returning the first document.
+///) Publishing/failure updates are
 /// conditional on the row still carrying the caller's claim id, so a late
 /// writer (whose lease expired in the meantime) never overwrites the row a
 /// newer claimant owns — and the loss is detectable (the update matches
@@ -82,7 +86,6 @@ public sealed class MongoOutboxEventStore : IOutboxEventStore
                 CreatedAtUtc = record.CreatedAtUtc,
                 ClaimableAtUtc = record.ClaimableAtUtc,
                 ClaimId = record.ClaimId,
-                LeaseUntilUtc = record.LeaseUntilUtc,
                 PublishedAtUtc = record.PublishedAtUtc,
                 TopicPartition = record.TopicPartition,
                 Offset = record.Offset,
@@ -107,22 +110,21 @@ public sealed class MongoOutboxEventStore : IOutboxEventStore
         // Publishable in one predicate: Pending rows whose backoff gate has
         // passed and Publishing rows whose lease expired (crash leftover).
         // Both conditions live in claimableAtUtc, so this is a single index
-        // range — no $or, no blocking in-memory sort — and the sort matches
-        // the index order, so "oldest claimable event first" is provided by
-        // the {status, claimableAtUtc} index itself.
+        // range — no $or, no blocking in-memory sort.
         var filter = Filter.And(
             Filter.In(
                 d => d.Status,
                 new[] { OutboxEventStatus.Pending, OutboxEventStatus.Publishing }),
             Filter.Lte(d => d.ClaimableAtUtc, now));
 
-        // Claim = take ownership: fresh claim id, lease and claim gate both
-        // pushed to the lease expiry.
+        // Claim = take ownership: fresh claim id and the claim gate pushed
+        // to the lease expiry (the lease itself — expiry makes the row
+        // claimable again — lives in the same field, so there is nothing
+        // else to write).
         var leaseUntil = now.AddSeconds(leaseSeconds);
         var update = Update
             .Set(d => d.Status, OutboxEventStatus.Publishing)
             .Set(d => d.ClaimId, Guid.NewGuid())
-            .Set(d => d.LeaseUntilUtc, leaseUntil)
             .Set(d => d.ClaimableAtUtc, leaseUntil)
             .Set(d => d.LastError, null);
 
@@ -135,9 +137,14 @@ public sealed class MongoOutboxEventStore : IOutboxEventStore
                 new FindOneAndUpdateOptions<OutboxEventDocument, OutboxEventDocument>
                 {
                     ReturnDocument = ReturnDocument.After,
-                    Sort = Sort.Combine(
-                        Sort.Ascending(d => d.ClaimableAtUtc),
-                        Sort.Ascending(d => d.Id))
+                    // Index-only sort: claimableAtUtc is the first key of the
+                    // {status, claimableAtUtc} index, so this never triggers
+                    // a blocking SORT stage (a second sort key outside the
+                    // index, e.g. _id, would sort the whole backlog in
+                    // memory before the first document is returned).
+                    // Ties on claimableAtUtc are ordered arbitrarily — any
+                    // order is fair for delivery.
+                    Sort = Sort.Ascending(d => d.ClaimableAtUtc)
                 },
                 cancellationToken)
             .ConfigureAwait(false);
@@ -173,7 +180,6 @@ public sealed class MongoOutboxEventStore : IOutboxEventStore
                     .Set(d => d.PublishedAtUtc, publishedAtUtc)
                     .Set(d => d.TopicPartition, partition)
                     .Set(d => d.Offset, offset)
-                    .Set(d => d.LeaseUntilUtc, null)
                     .Set(d => d.LastError, null),
                 null,
                 cancellationToken)
@@ -200,7 +206,6 @@ public sealed class MongoOutboxEventStore : IOutboxEventStore
         var update = Update
             .Set(d => d.Status, status)
             .Set(d => d.Attempts, newAttempts)
-            .Set(d => d.LeaseUntilUtc, null)
             .Set(d => d.LastError, lastError);
 
         // The backoff gate only exists while the row is retriable; Dead rows
@@ -236,7 +241,6 @@ public sealed class MongoOutboxEventStore : IOutboxEventStore
             document.CreatedAtUtc,
             document.ClaimableAtUtc,
             document.ClaimId,
-            document.LeaseUntilUtc,
             document.PublishedAtUtc,
             document.TopicPartition,
             document.Offset,

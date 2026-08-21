@@ -290,7 +290,6 @@ public sealed class MongoResourceRepository : IResourceRepository
                     CreatedAtUtc: now,
                     ClaimableAtUtc: now, // claimable immediately
                     ClaimId: Guid.Empty, // assigned when first claimed
-                    LeaseUntilUtc: null,
                     PublishedAtUtc: null,
                     TopicPartition: null,
                     Offset: null,

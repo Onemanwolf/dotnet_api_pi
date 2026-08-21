@@ -24,4 +24,14 @@ public sealed class KafkaOptions
     /// The topic that domain events are published to.
     /// </summary>
     public string Topic { get; init; } = "resource-events";
+
+    /// <summary>
+    /// Maximum time (milliseconds) a message may take before the producer
+    /// gives up on it (delivery deadline, including retries). This is the
+    /// per-message worst-case delay that bounds how long one claimed outbox
+    /// row can be held mid-publish — the relay's claim lease must outlive
+    /// the worst-case batch drain (see <see cref="DotNetApiPi.Infrastructure.Outbox.OutboxOptions.LeaseSeconds"/>
+    /// and the relay's startup guard).
+    /// </summary>
+    public int MessageTimeoutMs { get; init; } = 30_000;
 }

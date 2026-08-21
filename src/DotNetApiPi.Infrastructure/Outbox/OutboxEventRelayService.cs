@@ -32,6 +32,7 @@ public sealed class OutboxEventRelayService : IHostedService
     private readonly IKafkaEventPublisher _publisher;
     private readonly OutboxOptions _outboxOptions;
     private readonly string _topic;
+    private readonly int _messageTimeoutMs;
     private readonly TimeProvider _time;
     private readonly ILogger<OutboxEventRelayService> _logger;
     private CancellationTokenSource? _cts;
@@ -69,6 +70,7 @@ public sealed class OutboxEventRelayService : IHostedService
         _publisher = publisher;
         _outboxOptions = outboxOptions.Value;
         _topic = kafkaOptions.Value.Topic;
+        _messageTimeoutMs = kafkaOptions.Value.MessageTimeoutMs;
         _logger = logger;
         _time = timeProvider ?? TimeProvider.System;
     }
@@ -76,6 +78,27 @@ public sealed class OutboxEventRelayService : IHostedService
     /// <inheritdoc />
     public Task StartAsync(CancellationToken cancellationToken)
     {
+        // Configuration guard: a claim lease must outlive the worst-case
+        // drain of one full batch (batch / concurrency sequential rounds,
+        // each bounded by the broker message timeout). Below that, a slow
+        // broker can expire a claim mid-batch and a concurrent relay
+        // re-claims and double-publishes — at-least-once tolerates the
+        // duplicate, but the setting is misconfigured, not a behavior.
+        var worstCaseDrainSeconds = Math.Ceiling(
+                (double)_outboxOptions.BatchSize / _outboxOptions.PublishConcurrency)
+            * (_messageTimeoutMs / 1000.0);
+
+        if (_outboxOptions.LeaseSeconds < worstCaseDrainSeconds)
+        {
+            _logger.LogWarning(
+                "Outbox lease ({LeaseSeconds} s) is below the worst-case drain time for one batch: {BatchSize} events / {Concurrency} concurrent / {TimeoutMs} ms broker message timeout ≈ {DrainSeconds} s. A slow broker can expire claims mid-batch and a concurrent relay will double-publish. Raise Outbox:LeaseSeconds (or lower Kafka:MessageTimeoutMs).",
+                _outboxOptions.LeaseSeconds,
+                _outboxOptions.BatchSize,
+                _outboxOptions.PublishConcurrency,
+                _messageTimeoutMs,
+                worstCaseDrainSeconds);
+        }
+
         _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         _running = Task.Run(() => RunAsync(_cts.Token));
         return Task.CompletedTask;
@@ -123,13 +146,14 @@ public sealed class OutboxEventRelayService : IHostedService
     private async Task RunAsync(CancellationToken cancellationToken)
     {
         _logger.LogInformation(
-            "Outbox relay started (topic '{Topic}', poll {PollMs} ms, batch {BatchSize}, concurrency {Concurrency}, max attempts {MaxAttempts}, lease {LeaseSeconds} s).",
+            "Outbox relay started (topic '{Topic}', poll {PollMs} ms, batch {BatchSize}, concurrency {Concurrency}, max attempts {MaxAttempts}, lease {LeaseSeconds} s, message timeout {TimeoutMs} ms).",
             _topic,
             _outboxOptions.PollIntervalMs,
             _outboxOptions.BatchSize,
             _outboxOptions.PublishConcurrency,
             _outboxOptions.MaxAttempts,
-            _outboxOptions.LeaseSeconds);
+            _outboxOptions.LeaseSeconds,
+            _messageTimeoutMs);
 
         try
         {
@@ -274,6 +298,8 @@ public sealed class OutboxEventRelayService : IHostedService
                     result.Topic,
                     result.Partition,
                     result.Offset);
+
+                OutboxMetrics.PublishedEvents.Add(1, OutboxMetrics.EventTags(record.EventType).ToArray());
             }
             else
             {
@@ -331,16 +357,42 @@ public sealed class OutboxEventRelayService : IHostedService
                 cancellationToken)
             .ConfigureAwait(false);
 
+        var tags = OutboxMetrics.EventTags(record.EventType);
+
         if (retryAtUtc is null)
         {
-            _logger.LogError(
-                exception,
-                "Outbox event {EventId} exhausted {MaxAttempts} publish attempts and is now Dead. Inspect the row (lastError) and replay it on purpose (see README).",
-                record.EventId,
-                _outboxOptions.MaxAttempts);
+            if (recorded)
+            {
+                // Terminal: the row is Dead. This is an operator action
+                // item (replay runbook in the README), so it gets the
+                // highest log level plus its own metric.
+                _logger.LogCritical(
+                    exception,
+                    "Outbox event {EventId} ({EventType}) exhausted {MaxAttempts} publish attempts and is now Dead. Inspect the row (lastError) and replay it on purpose (see README).",
+                    record.EventId,
+                    record.EventType,
+                    _outboxOptions.MaxAttempts);
+
+                OutboxMetrics.DeadEvents.Add(1, tags.ToArray());
+            }
+            else
+            {
+                // The claim was lost before the terminal mark was applied;
+                // the new claimant owns the retry budget now and will log
+                // the Dead transition if their attempts run out.
+                _logger.LogError(
+                    exception,
+                    "Outbox event {EventId} exhausted its publish budget, but the claim was lost before the row could be marked Dead; the new claimant owns the retry budget now.",
+                    record.EventId);
+            }
         }
         else
         {
+            if (recorded)
+            {
+                OutboxMetrics.FailedAttempts.Add(1, tags.ToArray());
+            }
+
             _logger.LogWarning(
                 exception,
                 "Publish attempt {Attempts}/{MaxAttempts} for outbox event {EventId} ({EventType}) failed; retrying at {RetryAtUtc}.",

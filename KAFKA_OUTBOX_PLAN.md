@@ -21,6 +21,31 @@ Status: research complete — findings below are from primary sources (fetched 2
 > README documents the dead-letter replay runbook (O-10) and that the
 > outbox is Mongo-provider-only (O-11).
 
+> **Revision 3 (2026-08-20, review round 2 — W-1…W-5):** the claim query is
+> now fully index-only: the sort is on `claimableAtUtc` alone (the second key
+> of `status_claimableAtUtc`), with no `_id` tie-break that forced a blocking
+> in-memory SORT; MongoDB serves the claim via a `SORT_MERGE` of per-status
+> index scans (verified by an integration test that asserts the explain plan
+> has no blocking SORT and examines a single document over a 200-row
+> backlog). Ties on `claimableAtUtc` are intentionally arbitrary — fairness,
+> not ordering, is the requirement. The broker `message.timeout.ms` is now
+> configurable (`Kafka:MessageTimeoutMs`, default 30000) and the relay logs
+> a warning at startup when `Outbox:LeaseSeconds` cannot cover the
+> worst-case batch drain (`ceil(batchSize / publishConcurrency) *
+> messageTimeoutMs / 1000` ≈ 210 s at defaults); the default lease is 240 s
+> accordingly. The dead `LeaseUntilUtc` field is gone — `claimableAtUtc` is
+> the single claim gate. The relay emits OpenTelemetry counters on meter
+> `DotNetApiPi.Outbox` (`dotnet_api_pi.outbox.published` /
+> `failed_attempts` / `dead`, tagged by `event.type`), and the API wires in
+> runtime/ASP.NET/HttpClient metric instrumentation with an OTLP exporter
+> behind `OTEL_ENDPOINT`. A Testcontainers integration suite (real Mongo RS
+> + real KRaft broker, `Category=Integration`) now proves the load-bearing
+> invariants: aborted units of work leave no outbox row, a duplicate outbox
+> identity inside one transaction aborts the caller's session, concurrent
+> claimants never claim the same row, foreign-claim marks are no-ops,
+> expired leases reclaim under a fresh `claimId`, and the full path
+> publishes the stable envelope + `x-event-id` header to a real broker.
+
 ---
 
 ## 1. Research findings (deep research, 2026-08-20)

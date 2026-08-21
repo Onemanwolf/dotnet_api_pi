@@ -8,6 +8,7 @@ using DotNetApiPi.Application;
 using DotNetApiPi.Infrastructure;
 using DotNetApiPi.Infrastructure.Persistence;
 using Microsoft.AspNetCore.Mvc;
+using OpenTelemetry.Metrics;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 
@@ -208,6 +209,10 @@ builder.Services.AddRateLimiter(options =>
 // by default. The trace context coexists with the X-Correlation-Id
 // middleware: the correlation id correlates operational log lines, the W3C
 // trace context is for distributed tracing.
+// Metrics: .NET runtime + ASP.NET Core + HTTP client instrumentation plus
+// the outbox relay counters (dotnet_api_pi.outbox.published /
+// .failed_attempts / .dead, tagged by event.type) are always collected
+// in-process and only leave the process when OTLP export is enabled.
 const string otelServiceName = "dotnet-api-pi";
 const string otelServiceVersion = "1.0.0";
 var otelEnabled = builder.Configuration["Otel:Enabled"] == "true"
@@ -225,6 +230,18 @@ builder.Services
     .WithTracing(tracing =>
     {
         var pipeline = tracing
+            .AddAspNetCoreInstrumentation()
+            .AddHttpClientInstrumentation();
+
+        if (otelEnabled)
+        {
+            pipeline.AddOtlpExporter(options => options.Endpoint = otelEndpoint);
+        }
+    })
+    .WithMetrics(metrics =>
+    {
+        var pipeline = metrics
+            .AddRuntimeInstrumentation()
             .AddAspNetCoreInstrumentation()
             .AddHttpClientInstrumentation();
 

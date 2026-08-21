@@ -66,9 +66,13 @@ public sealed class ConfluentKafkaEventPublisher : IKafkaEventPublisher, IAsyncD
             MessageMaxBytes = 1_000_000,
             // Hard deadline for a produce (including internal retries): on
             // expiry, ProduceAsync faults and the relay records a failed
-            // attempt. (librdkafka's message.timeout.ms — Confluent.Kafka
-            // 2.15 no longer exposes the old delivery-timeout setting.)
-            MessageTimeoutMs = 30_000
+            // attempt. Configurable (Kafka:MessageTimeoutMs) because it
+            // bounds the worst-case per-message publish delay, which the
+            // relay's claim lease must outlive (see OutboxOptions.
+            // LeaseSeconds and the relay's startup guard).
+            // (librdkafka's message.timeout.ms — Confluent.Kafka 2.15 no
+            // longer exposes the old delivery-timeout setting.)
+            MessageTimeoutMs = kafka.MessageTimeoutMs
         };
 
         _producer = new ProducerBuilder<string, string>(config)
