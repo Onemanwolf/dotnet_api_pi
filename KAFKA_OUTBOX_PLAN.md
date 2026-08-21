@@ -46,6 +46,28 @@ Status: research complete — findings below are from primary sources (fetched 2
 > expired leases reclaim under a fresh `claimId`, and the full path
 > publishes the stable envelope + `x-event-id` header to a real broker.
 
+> **Revision 4 (2026-08-21, review round 3 — W-7/W-8):** the outbox meter
+> is now **registered** in the composition root
+> (`AddMeter(OutboxMetrics.MeterName)` in `Program.cs`) — the round-3
+> registration-free assumption was wrong: a `MeterProvider` collects only
+> explicitly registered meters, so the counters were inert (verified against
+> a real OTLP collector: no `DotNetApiPi.Outbox` scope at all). The
+> `OutboxMetrics` comment that documented the wrong behavior was
+> corrected, and the meter name is a `const` public-contract value
+> (`DotNetApiPi.Outbox`). Verified end to end: with `Otel__Enabled=true`
+> and a collector attached, creating a resource exports
+> `dotnet_api_pi.outbox.published` (value 1) under scope
+> `DotNetApiPi.Outbox` while all built-in scopes keep exporting. A
+> config leftover — `appsettings.json` pinned `Outbox:LeaseSeconds: 30`,
+> overriding the round-3 default of 240 and tripping the W-2 startup
+> guard on every dev boot — was raised to 240 so the documented default
+> actually applies. `AbortAfterOutboxAppend_LeavesNoOutboxRow` closes the
+> transaction-test ordering gap: two aggregates, the second's insert
+> failing on a seeded duplicate key, asserting no outbox row survives
+> whatever statement order the unit of work uses (it would fail if the
+> outbox append were reordered before the aggregate writes and made
+> non-transactional).
+
 ---
 
 ## 1. Research findings (deep research, 2026-08-20)

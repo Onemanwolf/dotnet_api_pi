@@ -499,3 +499,53 @@ round-2 outbox work. All items addressed; full local gate green
 - xunit analyzers under `-warnaserror` forbid `ConfigureAwait(false)` and
   blocking task operations in test methods — the integration tests follow
   the existing test style (plain `await`).
+
+## Outbox review round 4 (2026-08-21)
+
+`OUTBOX_CORRECTIONS_SPEC_R4.md` (W-7, W-8) — verification of round 3
+against a running stack and a real OTLP collector found the metrics
+feature inert and one ordering gap in the transaction tests. Both fixed;
+local gate green (198 tests) and CI verified on the resulting commit.
+
+### What changed
+
+- **W-7 — the outbox meter is now actually registered.** Root cause: the
+  round-3 assumption that "OTel picks up every `Meter` created in the
+  process" is false — a `MeterProvider` collects only meters registered
+  with `AddMeter(...)`; an unregistered meter silently drops every
+  measurement (the counters exist and `Add()` succeeds, which made it
+  hard to notice). Proven against a real OTLP collector: with
+  `Otel__Enabled=true` the built-in scopes exported but `DotNetApiPi.Outbox`
+  never arrived. Fix: `OutboxMetrics.MeterName` is now a `const string`
+  public-contract value used in the `Meter` constructor, the misleading
+  comment is corrected, and `Program.cs` registers the meter as the first
+  `.WithMetrics(...)` entry. Verified: creating a resource exports
+  `dotnet_api_pi.outbox.published` (value 1, tag `event.type`) under scope
+  `DotNetApiPi.Outbox 1.0.0` while all seven built-in scopes keep
+  exporting. (Metric names kept as the round-3 contract
+  `dotnet_api_pi.outbox.*`; the R4 spec's (c)/AC4 text listed different
+  names while simultaneously calling the existing counters "correct" and
+  "unchanged" — the implemented names are the stable contract.)
+- **Lease config leftover (found while verifying W-7):** `appsettings.json`
+  pinned `Outbox:LeaseSeconds: 30`, overriding the round-3 default of 240 —
+  the W-2 startup guard warned on every dev boot. Raised to 240; the fresh
+  dev stack now starts quiet.
+- **W-8 — `AbortAfterOutboxAppend_LeavesNoOutboxRow`.** The existing pair
+  covered the append-joins-the-session coupling, but only for the current
+  statement order (verified empirically in the R4 spec: with the append
+  sabotaged to ignore the caller's session, only the store-level test
+  failed). The new test stages two aggregates — A clean, B a seeded
+  duplicate key so its insert fails — and asserts `outbox_events` is empty
+  and neither write survived, whatever order the unit of work applies
+  statements in. If the append were reordered before the aggregate writes
+  *and* made non-transactional, A's rows would commit and this test would
+  fail.
+
+### Not defects (per R4, left alone)
+
+- The Kafka integration test's local `Local: Message timed out` under
+  docker-in-docker (advertised listener unroutable from the test
+  container); it passes on GitHub Actions with a native Docker daemon.
+- `docsExamined: 0` when explaining the claim query on an idle
+  (all-Published) collection — the populated case is covered by the
+  backlog test.

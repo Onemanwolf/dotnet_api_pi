@@ -6,6 +6,7 @@ using DotNetApiPi.Api.RateLimiting;
 using DotNetApiPi.Api.Results;
 using DotNetApiPi.Application;
 using DotNetApiPi.Infrastructure;
+using DotNetApiPi.Infrastructure.Outbox;
 using DotNetApiPi.Infrastructure.Persistence;
 using Microsoft.AspNetCore.Mvc;
 using OpenTelemetry.Metrics;
@@ -241,6 +242,8 @@ builder.Services
     .WithMetrics(metrics =>
     {
         var pipeline = metrics
+            // Without this the outbox counters are collected by nothing.
+            .AddMeter(OutboxMetrics.MeterName)
             .AddRuntimeInstrumentation()
             .AddAspNetCoreInstrumentation()
             .AddHttpClientInstrumentation();

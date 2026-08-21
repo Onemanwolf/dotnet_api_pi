@@ -122,6 +122,59 @@ public sealed class OutboxTransactionIntegrationTests : IClassFixture<MongoRepli
 
     [Trait("Category", "Integration")]
     [Fact(Timeout = 120_000)]
+    public async Task AbortAfterOutboxAppend_LeavesNoOutboxRow()
+    {
+        // Ordering-gap guard (round 4, W-8). Two aggregates are staged:
+        // A (clean) and B (a seeded duplicate key makes its insert fail).
+        // Whatever the statement order inside the unit-of-work transaction
+        // is, the abort must roll back everything — and in particular, if
+        // the outbox append had already run (today it runs after the
+        // aggregate writes; a future reordering that moves it earlier —
+        // combined with a non-transactional append — would commit A's rows
+        // while B's write aborts, leaving an event for a state change that
+        // never committed), no outbox row may survive.
+        var database = _fixture.CreateDatabase();
+        var resources = database.GetCollection<ResourceDocument>("Resources");
+        var store = new MongoOutboxEventStore(database);
+        var client = _fixture.Client;
+
+        var resourceA = Resource.Create(new ResourceName("abort-after-append-a"));
+        var resourceB = Resource.Create(new ResourceName("abort-after-append-b"));
+
+        // B's identity is already taken: its insert fails inside the
+        // transaction, after A's writes/outbox rows are (or would be) in.
+        await resources
+            .InsertOneAsync(ResourceDocumentMapper.ToDocument(resourceB));
+
+        var repository = new MongoResourceRepository(
+            client,
+            resources,
+            store,
+            new NoOpEventDispatcher());
+
+        await repository.AddAsync(resourceA);
+        await repository.AddAsync(resourceB);
+
+        await Assert
+            .ThrowsAsync<MongoWriteException>(() => repository.SaveChangesAsync());
+
+        // A's ResourceCreated event must not have leaked... (the
+        // transactional-outbox invariant: an event is handed to the
+        // publisher iff the state change committed).
+        var outbox = database.GetCollection<OutboxEventDocument>(MongoOutboxEventStore.CollectionName);
+        var outboxCount = await outbox
+            .CountDocumentsAsync(FilterDefinition<OutboxEventDocument>.Empty);
+        Assert.Equal(0L, outboxCount);
+
+        // ...and neither aggregate write survived: only B's pre-seeded
+        // document is in the collection.
+        var countA = await resources
+            .CountDocumentsAsync(Builders<ResourceDocument>.Filter.Eq(d => d.Id, resourceA.Id));
+        Assert.Equal(0L, countA);
+    }
+
+    [Trait("Category", "Integration")]
+    [Fact(Timeout = 120_000)]
     public async Task CommittedUnitOfWork_WritesAggregateAndOutboxAtomically()
     {
         var database = _fixture.CreateDatabase();

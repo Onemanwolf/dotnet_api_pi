@@ -294,7 +294,15 @@ exposing the API publicly.
   to enable; the endpoint comes from `Otel:Exporter:Otlp:Endpoint`
   (env `OTEL_EXPORTER_OTLP_ENDPOINT`), default `http://localhost:4317`.
   Metrics include the standard .NET runtime / ASP.NET Core / HTTP client
-  instrumentation plus the outbox relay counters (see “Outbox operations”).
+  instrumentation plus the outbox relay counters on the `DotNetApiPi.Outbox`
+  meter — `dotnet_api_pi.outbox.published` (published to Kafka and recorded
+  as `Published`), `dotnet_api_pi.outbox.failed_attempts` (failed attempts
+  back to `Pending` with backoff) and `dotnet_api_pi.outbox.dead` (rows that
+  exhausted the retry budget — alert on this one; it is the trigger for the
+  dead-row replay runbook below). All three are tagged by the stable
+  `event.type` wire name and are exported only when `Otel:Enabled` is
+  `true` (the meter is registered via `AddMeter` in the composition root —
+  an unregistered meter would silently drop every measurement).
 - **Domain events** — the unit of work dispatches aggregate domain events to
   `IDomainEventSubscriber<TEvent>` subscribers after the write commits. The
   built-in `ResourceCreatedEventLogSubscriber` logs resource creations;

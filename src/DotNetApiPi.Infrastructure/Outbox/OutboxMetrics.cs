@@ -3,17 +3,30 @@ using System.Diagnostics.Metrics;
 namespace DotNetApiPi.Infrastructure.Outbox;
 
 /// <summary>
-/// Outbox relay metrics. Counters are created on first touch (OTel picks
-/// up every <see cref="Meter"/> that is created in the process; the API's
-/// <c>WithMetrics</c> block exports them — to OTLP when <c>Otel:Enabled</c>
-/// is set, to the <c>/metrics</c> Prometheus endpoint otherwise). Tagged by
-/// the stable <c>event.type</c> wire name (bounded: only registered event
+/// Outbox relay metrics.
+/// <para>
+/// The meter must be registered explicitly in the composition root with
+/// <c>AddMeter(OutboxMetrics.MeterName)</c>. OpenTelemetry does NOT
+/// discover meters by itself — an unregistered <see cref="Meter"/>
+/// silently drops every measurement (the counters still exist and
+/// <c>Add()</c> still succeeds, which is what makes the mistake hard to
+/// notice). When registered, measurements are exported only when OTLP
+/// export is enabled (<c>Otel:Enabled</c> is <c>true</c>). Tags are the
+/// stable <c>event.type</c> wire name only (bounded: only registered event
 /// types reach this point).
+/// </para>
 /// </summary>
 public static class OutboxMetrics
 {
+    /// <summary>
+    /// Stable meter name. This is the identity dashboards and exporters
+    /// bind to — treat it as a public contract and do not rename it
+    /// casually.
+    /// </summary>
+    public const string MeterName = "DotNetApiPi.Outbox";
+
     /// <summary>The meter that owns the outbox instruments.</summary>
-    public static readonly Meter Meter = new("DotNetApiPi.Outbox");
+    public static readonly Meter Meter = new(MeterName, "1.0.0");
 
     /// <summary>
     /// Events published to Kafka and recorded as <c>Published</c> on the
